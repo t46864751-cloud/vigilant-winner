@@ -1,3 +1,6 @@
 python-telegram-bot==20.7
-docker==7.0.0
-RestrictedPython==7.0
+Pillow
+matplotlib
+numpy
+requests
+aiohttp
