@@ -5,7 +5,7 @@ import tempfile
 import io
 from contextlib import redirect_stdout
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
 
 TOKEN = "8608832312:AAGKkMZTYMth41mBqiTqjhSYJypFePgtM0s"
 
@@ -16,34 +16,7 @@ if DOCKER_AVAILABLE:
     client = docker.from_env()
 
 if not DOCKER_AVAILABLE:
-    from RestrictedPython import compile_restricted, safe_globals
-    from RestrictedPython.Guards import safe_builtins
-
-def run_in_docker(code: str) -> dict:
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        f.write(code)
-        temp_file = f.name
-    
-    try:
-        container = client.containers.run(
-            image="python:3.11-alpine sys
-import asyncio
-import tempfile
-import io
-from contextlib import redirect_stdout
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
-
-TOKEN = "8608832312:AAGKkMZTYMth41mBqiTqjhSYJypFePgtM0s"
-
-DOCKER_AVAILABLE = os.path.exists('/var/run/docker.sock')
-
-if DOCKER_AVAILABLE:
-    import docker
-    client = docker.from_env()
-
-if not DOCKER_AVAILABLE:
-    from RestrictedPython import compile_restricted, safe_globals
+    from RestrictedPython import compile_restricted
     from RestrictedPython.Guards import safe_builtins
 
 def run_in_docker(code: str) -> dict:
@@ -69,11 +42,11 @@ def run_in_docker(code: str) -> dict:
             return {
                 "success": result['StatusCode'] == 0,
                 "output": logs,
-                "error": None if result['StatusCode'] == 0 else f"Exit code: {result['StatusCode']}"
+                "error": None if result['StatusCode'] == 0 else "Exit code: " + str(result['StatusCode'])
             }
         except Exception as e:
             container.kill()
-            return {"success": False, "output": "", "error": f"⏱️ Таймаут (10 сек)"}
+            return {"success": False, "output": "", "error": "⏱️ Таймаут (10 сек)"}
             
     finally:
         if os.path.exists(temp_file):
@@ -107,7 +80,7 @@ def run_restricted(code: str) -> dict:
         }
         
     except Exception as e:
-        return {"success": False, "output": "", "error": f"⚠️ {str(e)}"}
+        return {"success": False, "output": "", "error": "⚠️ " + str(e)}
 
 async def execute_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -122,17 +95,17 @@ async def execute_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if result["success"]:
         text = (
-            f"✅ *Успешно выполнено*\n\n"
-            f"🔧 Метод: {method}\n"
-            f"💻 Код:\n```python\n{user_code}\n```\n"
-            f"📤 Вывод:\n```\n{result['output'][:3000]}\n```"
+            "✅ *Успешно выполнено*\n\n"
+            "🔧 Метод: " + method + "\n"
+            "💻 Код:\n```python\n" + user_code + "\n```\n"
+            "📤 Вывод:\n```\n" + result['output'][:3000] + "\n```"
         )
     else:
         text = (
-            f"❌ *Ошибка выполнения*\n\n"
-            f"🔧 Метод: {method}\n"
-            f"💻 Код:\n```python\n{user_code}\n```\n"
-            f"🚨 Ошибка: `{result['error']}`"
+            "❌ *Ошибка выполнения*\n\n"
+            "🔧 Метод: " + method + "\n"
+            "💻 Код:\n```python\n" + user_code + "\n```\n"
+            "🚨 Ошибка: `" + result['error'] + "`"
         )
     
     await context.bot.send_message(chat_id=user_id, text=text, parse_mode='Markdown')
@@ -141,7 +114,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🚀 *PySandbox Bot*\n\n"
         "Отправь мне любой Python-код, и я выполню его в изолированной среде!\n\n"
-        f"{'🐳 Режим: Docker' if DOCKER_AVAILABLE else '🔒 Режим: RestrictedPython'}",
+        + ('🐳 Режим: Docker' if DOCKER_AVAILABLE else '🔒 Режим: RestrictedPython'),
         parse_mode='Markdown'
     )
 
@@ -152,5 +125,4 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
-    from telegram.ext import CommandHandler
     main()
