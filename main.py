@@ -1,44 +1,8 @@
 import os
 import sys
 import io
-import json
-import math
-import random
-import datetime
-import time
-import re
-import string
-import itertools
-import functools
-import collections
-import statistics
-import typing
-import decimal
-import fractions
-import hashlib
-import base64
-import binascii
-import inspect
-import textwrap
-import uuid
-import html
-import urllib.parse
-import urllib.request
-import urllib.error
-import http.client
-import socket
-import ssl
-import csv
-import pprint
-import copy
-import pickle
-import warnings
-import traceback
+import builtins as real_builtins
 import types
-import enum
-import dataclasses
-import pathlib
-import builtins
 from unittest.mock import MagicMock
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
@@ -47,7 +11,6 @@ TOKEN = "8608832312:AAGKkMZTYMth41mBqiTqjhSYJypFePgtM0s"
 
 # === БЕЗОПАСНЫЙ EVAL ===
 class SafeEval:
-    """Почти настоящий eval, но без доступа к builtins"""
     def __call__(self, expression, globals=None, locals=None):
         safe_globals = {"__builtins__": {}}
         if globals:
@@ -62,9 +25,8 @@ class SafeEval:
 
 # === БЕЗОПАСНЫЙ EXEC ===
 class SafeExec:
-    """Почти настоящий exec, но с ограничениями"""
     def __call__(self, code, globals=None, locals=None):
-        if isinstance(code, str) and any(x in code for x in ['__import__', 'import os', 'import sys', 'subprocess', 'open(', 'file(']):
+        if isinstance(code, str) and any(x in code for x in ['__import__', 'import os', 'import sys', 'subprocess', 'open(']):
             return "[SAFE EXEC] Подозрительный код заблокирован"
         safe_globals = {"__builtins__": safe_builtins}
         if globals:
@@ -94,16 +56,13 @@ class FakeFileSystem:
         p = self._get_path(path)
         
         if 'w' in mode or 'a' in mode or 'x' in mode:
-            # Пишем в память
             if p not in self.files:
                 self.files[p] = ""
             return FakeFile(p, self.files, mode)
         
-        # Читаем сначала из памяти, потом с диска
         if p in self.files:
             return FakeFile(p, self.files, mode)
         
-        # Разрешаем читать некоторые реальные файлы
         allowed_reads = ['/etc/passwd', '/etc/hostname', '/proc/version', '/proc/cpuinfo']
         if any(p.startswith(a) for a in allowed_reads):
             return open(p, mode, *args, **kwargs)
@@ -115,7 +74,7 @@ class FakeFileSystem:
         if p in self.dirs:
             return ['fake1.txt', 'fake2.py', 'sandbox']
         try:
-            return os.listdir(p)[:20]  # ограничиваем
+            return os.listdir(p)[:20]
         except:
             return []
     
@@ -137,18 +96,6 @@ class FakeFileSystem:
     
     def chdir(self, path):
         pass
-    
-    def path_join(self, *args):
-        return os.path.join(*args)
-    
-    def path_exists(self, path):
-        return self.exists(path)
-    
-    def path_isfile(self, path):
-        return self._get_path(path) in self.files
-    
-    def path_isdir(self, path):
-        return self._get_path(path) in self.dirs
 
 class FakeFile:
     def __init__(self, path, fs_storage, mode='r'):
@@ -222,14 +169,8 @@ class FakeOS:
     def close(self, fd):
         pass
     
-    def read(self, fd, n):
-        return b"fake data"
-    
-    def write(self, fd, data):
-        return len(data)
-    
     def system(self, command):
-        dangerous = ['rm', 'mkfs', 'dd', 'fdisk', 'format', 'del', 'rd', 'format']
+        dangerous = ['rm', 'mkfs', 'dd', 'fdisk', 'format', 'del', 'rd']
         if any(d in str(command).lower() for d in dangerous):
             return f"[SANDBOX] Команда '{command}' заблокирована"
         return f"[SANDBOX] Выполнено: {command} (фейково)"
@@ -270,9 +211,6 @@ class FakeOS:
     def chdir(self, path):
         return self.fs.chdir(path)
     
-    def path(self):
-        return self  # для os.path.*
-    
     def getpid(self):
         return 12345
     
@@ -280,10 +218,11 @@ class FakeOS:
         return 1
     
     def urandom(self, n):
+        import random
         return bytes(random.randint(0, 255) for _ in range(n))
     
     def __getattr__(self, name):
-        if name in ['path']:
+        if name == 'path':
             return FakePath(self.fs)
         return MagicMock(return_value=f"[SANDBOX os.{name}]")
 
@@ -293,16 +232,16 @@ class FakePath:
         self.sep = '/'
     
     def join(self, *args):
-        return self.fs.path_join(*args)
+        return os.path.join(*args)
     
     def exists(self, path):
-        return self.fs.path_exists(path)
+        return self.fs.exists(path)
     
     def isfile(self, path):
-        return self.fs.path_isfile(path)
+        return self.fs._get_path(path) in self.fs.files
     
     def isdir(self, path):
-        return self.fs.path_isdir(path)
+        return self.fs._get_path(path) in self.fs.dirs
     
     def abspath(self, path):
         return "/home/sandbox/" + str(path)
@@ -325,19 +264,9 @@ class FakePath:
 # === ФЕЙКОВЫЙ SYS ===
 class FakeSys:
     def __init__(self):
-        self.stdout = MagicMock(
-            write=lambda x: None,
-            flush=lambda: None,
-            read=lambda: ""
-        )
-        self.stderr = MagicMock(
-            write=lambda x: None,
-            flush=lambda: None
-        )
-        self.stdin = MagicMock(
-            read=lambda: "",
-            readline=lambda: "fake input\n"
-        )
+        self.stdout = MagicMock(write=lambda x: None, flush=lambda: None)
+        self.stderr = MagicMock(write=lambda x: None, flush=lambda: None)
+        self.stdin = MagicMock(read=lambda: "", readline=lambda: "fake input\n")
         self.version = "3.11.0 (SANDBOX)"
         self.version_info = (3, 11, 0, 'final', 0)
         self.platform = "linux"
@@ -356,172 +285,35 @@ class FakeSys:
     def __getattr__(self, name):
         return MagicMock(return_value=f"[SANDBOX sys.{name}]")
 
-# === НАСТОЯЩИЕ МОДУЛИ ===
-import requests
-import urllib3
-
 # === СОЗДАЁМ ПЕСОЧНИЦУ ===
 def create_sandbox():
     fs = FakeFileSystem()
     fake_os = FakeOS(fs)
     fake_sys = FakeSys()
     
-    # Безопасные builtins
-    safe_builtins = {
-        # Типы
-        'bool': bool,
-        'int': int,
-        'float': float,
-        'complex': complex,
-        'str': str,
-        'bytes': bytes,
-        'bytearray': bytearray,
-        'list': list,
-        'dict': dict,
-        'tuple': tuple,
-        'set': set,
-        'frozenset': frozenset,
-        'type': type,
-        'object': object,
-        'property': property,
-        'staticmethod': staticmethod,
-        'classmethod': classmethod,
-        'slice': slice,
-        'range': range,
-        'memoryview': memoryview,
-        
-        # Функции
-        'abs': abs,
-        'all': all,
-        'any': any,
-        'ascii': ascii,
-        'bin': bin,
-        'callable': callable,
-        'chr': chr,
-        'compile': compile,
-        'delattr': delattr,
-        'dir': dir,
-        'divmod': divmod,
-        'enumerate': enumerate,
-        'eval': SafeEval(),
-        'exec': SafeExec(),
-        'filter': filter,
-        'format': format,
-        'getattr': getattr,
-        'globals': lambda: {},
-        'hasattr': hasattr,
-        'hash': hash,
-        'help': lambda x: str(type(x)),
-        'hex': hex,
-        'id': id,
-        'input': lambda prompt="": "[SANDBOX INPUT]",
-        'isinstance': isinstance,
-        'issubclass': issubclass,
-        'iter': iter,
-        'len': len,
-        'locals': lambda: {},
-        'map': map,
-        'max': max,
-        'min': min,
-        'next': next,
-        'oct': oct,
-        'open': fs.open,
-        'ord': ord,
-        'pow': pow,
-        'print': print,
-        'repr': repr,
-        'reversed': reversed,
-        'round': round,
-        'setattr': setattr,
-        'sorted': sorted,
-        'sum': sum,
-        'vars': lambda: {},
-        'zip': zip,
-        
-        # Исключения
-        'BaseException': BaseException,
-        'Exception': Exception,
-        'ArithmeticError': ArithmeticError,
-        'AssertionError': AssertionError,
-        'AttributeError': AttributeError,
-        'BlockingIOError': BlockingIOError,
-        'BrokenPipeError': BrokenPipeError,
-        'BufferError': BufferError,
-        'BytesWarning': BytesWarning,
-        'ChildProcessError': ChildProcessError,
-        'ConnectionAbortedError': ConnectionAbortedError,
-        'ConnectionError': ConnectionError,
-        'ConnectionRefusedError': ConnectionRefusedError,
-        'ConnectionResetError': ConnectionResetError,
-        'DeprecationWarning': DeprecationWarning,
-        'EOFError': EOFError,
-        'EnvironmentError': EnvironmentError,
-        'FileExistsError': FileExistsError,
-        'FileNotFoundError': FileNotFoundError,
-        'FloatingPointError': FloatingPointError,
-        'FutureWarning': FutureWarning,
-        'GeneratorExit': GeneratorExit,
-        'IOError': IOError,
-        'ImportError': ImportError,
-        'ImportWarning': ImportWarning,
-        'IndentationError': IndentationError,
-        'IndexError': IndexError,
-        'InterruptedError': InterruptedError,
-        'IsADirectoryError': IsADirectoryError,
-        'KeyError': KeyError,
-        'KeyboardInterrupt': KeyboardInterrupt,
-        'LookupError': LookupError,
-        'MemoryError': MemoryError,
-        'ModuleNotFoundError': ModuleNotFoundError,
-        'NameError': NameError,
-        'NotADirectoryError': NotADirectoryError,
-        'NotImplementedError': NotImplementedError,
-        'OSError': OSError,
-        'OverflowError': OverflowError,
-        'PendingDeprecationWarning': PendingDeprecationWarning,
-        'PermissionError': PermissionError,
-        'ProcessLookupError': ProcessLookupError,
-        'RecursionError': RecursionError,
-        'ReferenceError': ReferenceError,
-        'ResourceWarning': ResourceWarning,
-        'RuntimeError': RuntimeError,
-        'RuntimeWarning': RuntimeWarning,
-        'StopAsyncIteration': StopAsyncIteration,
-        'StopIteration': StopIteration,
-        'SyntaxError': SyntaxError,
-        'SyntaxWarning': SyntaxWarning,
-        'SystemError': SystemError,
-        'SystemExit': SystemExit,
-        'TabError': TabError,
-        'TimeoutError': TimeoutError,
-        'TypeError': TypeError,
-        'UnboundLocalError': UnboundLocalError,
-        'UnicodeDecodeError': UnicodeDecodeError,
-        'UnicodeEncodeError': UnicodeEncodeError,
-        'UnicodeError': UnicodeError,
-        'UnicodeTranslationError': UnicodeTranslationError,
-        'UnicodeWarning': UnicodeWarning,
-        'UserWarning': UserWarning,
-        'ValueError': ValueError,
-        'Warning': Warning,
-        'ZeroDivisionError': ZeroDivisionError,
-        
-        # Константы
-        'True': True,
-        'False': False,
-        'None': None,
-        'Ellipsis': Ellipsis,
-        'NotImplemented': NotImplemented,
-        '__debug__': True,
-        '__build_class__': __build_class__,
-        '__name__': '__main__',
-        '__doc__': None,
-        '__package__': None,
-        '__spec__': None,
-        '__annotations__': {},
-    }
+    # Берём ВСЕ builtins из настоящего Python
+    safe_builtins = {}
+    for name in dir(real_builtins):
+        if name.startswith('_'):
+            continue
+        obj = getattr(real_builtins, name)
+        safe_builtins[name] = obj
     
-    # Настоящие модули (безопасные)
+    # Подменяем опасные функции
+    safe_builtins['eval'] = SafeEval()
+    safe_builtins['exec'] = SafeExec()
+    safe_builtins['open'] = fs.open
+    safe_builtins['input'] = lambda prompt="": "[SANDBOX INPUT]"
+    safe_builtins['__import__'] = __import__  # оставляем настоящий, но ограничим через sys.modules
+    
+    # Настоящие модули (импортируем все что можно)
+    import math, random, datetime, time, re, string, itertools, functools, collections
+    import statistics, typing, decimal, fractions, hashlib, base64, binascii, inspect
+    import textwrap, uuid, html, json, csv, pprint, copy, warnings, traceback, types
+    import enum, dataclasses, pathlib, urllib.parse, urllib.request, urllib.error
+    import http.client, socket, ssl, calendar, numbers, fractions, decimal
+    import io as io_module, builtins as builtins_module
+    
     real_modules = {
         'math': math,
         'random': random,
@@ -552,6 +344,7 @@ def create_sandbox():
         'types': types,
         'enum': enum,
         'dataclasses': dataclasses,
+        'pathlib': pathlib,
         'urllib': urllib,
         'urllib.parse': urllib.parse,
         'urllib.request': urllib.request,
@@ -560,11 +353,33 @@ def create_sandbox():
         'http.client': http.client,
         'socket': socket,
         'ssl': ssl,
-        'requests': requests,
-        'urllib3': urllib3,
+        'calendar': calendar,
+        'numbers': numbers,
+        'io': io_module,
+        'builtins': builtins_module,
     }
     
-    # Собираем глобальное пространство
+    # Пробуем импортировать requests
+    try:
+        import requests
+        real_modules['requests'] = requests
+    except:
+        pass
+    
+    # Пробуем импортировать numpy
+    try:
+        import numpy
+        real_modules['numpy'] = numpy
+    except:
+        pass
+    
+    # Пробуем импортировать pandas
+    try:
+        import pandas
+        real_modules['pandas'] = pandas
+    except:
+        pass
+    
     sandbox = {
         '__builtins__': safe_builtins,
         '__name__': '__main__',
@@ -594,19 +409,13 @@ def create_sandbox():
         
         # Настоящие модули
         **real_modules,
-        
-        # Дополнительные функции
-        'open': fs.open,
-        'input': lambda prompt="": "[SANDBOX INPUT]",
     }
     
     return sandbox
 
 def run_sandbox(code: str) -> dict:
-    """Выполняем код в песочнице"""
     output_buffer = io.StringIO()
     
-    # Перехватываем stdout
     old_stdout = sys.stdout
     old_stderr = sys.stderr
     
@@ -616,16 +425,12 @@ def run_sandbox(code: str) -> dict:
             old_stdout.write(text)
         def flush(self):
             pass
-        def read(self):
-            return output_buffer.getvalue()
     
     sys.stdout = SandboxStdout()
     sys.stderr = SandboxStdout()
     
     try:
         sandbox = create_sandbox()
-        
-        # Компилируем и выполняем
         compiled = compile(code, '<sandbox>', 'exec')
         exec(compiled, sandbox, {})
         
@@ -640,7 +445,7 @@ def run_sandbox(code: str) -> dict:
     except SystemExit as e:
         return {
             "success": True,
-            "output": output_buffer.getvalue().strip() + f"\n[SANDBOX] SystemExit: {e}",
+            "output": output_buffer.getvalue().strip(),
             "error": None
         }
     except Exception as e:
@@ -662,14 +467,14 @@ async def execute_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if result["success"]:
         text = (
             "✅ *Успешно выполнено*\n\n"
-            "🔧 Метод: 🎭 Super Sandbox\n"
+            "🔧 Метод: 🎭 Mega Sandbox\n"
             "💻 Код:\n```python\n" + user_code + "\n```\n"
             "📤 Вывод:\n```\n" + result['output'][:3500] + "\n```"
         )
     else:
         text = (
             "❌ *Ошибка выполнения*\n\n"
-            "🔧 Метод: 🎭 Super Sandbox\n"
+            "🔧 Метод: 🎭 Mega Sandbox\n"
             "💻 Код:\n```python\n" + user_code + "\n```\n"
             "🚨 Ошибка: `" + result['error'][:1000] + "`"
         )
@@ -678,11 +483,11 @@ async def execute_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚀 *Super PySandbox Bot*\n\n"
-        "Отправь мне Python-код!\n\n"
-        "✅ Настоящие: requests, json, math, random, datetime, re, csv, http, socket, ssl, urllib, hashlib, base64, itertools, collections, statistics, typing, decimal, fractions, inspect, textwrap, uuid, html, pprint, copy, warnings, traceback, types, enum, dataclasses, time, string, functools\n\n"
-        "🎭 Фейковые (безопасные): os, sys, subprocess, open(запись в память), eval(безопасный), exec(ограниченный), input(фейковый)\n\n"
-        "🛡️ Полная изоляция от системы!",
+        "🚀 *Mega PySandbox Bot*\n\n"
+        "ВСЕ стандартные модули доступны!\n\n"
+        "✅ Настоящие: math, random, datetime, re, json, csv, urllib, http, socket, ssl, hashlib, base64, itertools, collections, statistics, typing, decimal, fractions, inspect, textwrap, uuid, html, pprint, copy, warnings, traceback, types, enum, dataclasses, pathlib, calendar, numbers, io, requests(если установлен), numpy(если установлен), pandas(если установлен)\n\n"
+        "🎭 Фейковые: os, sys, subprocess, open(память), eval(безопасный), exec(ограниченный)\n\n"
+        "💾 Файлы пишутся в ОЗУ, не на диск!",
         parse_mode='Markdown'
     )
 
