@@ -3,6 +3,8 @@ import sys
 import io
 import builtins as real_builtins
 import types
+import time
+import asyncio
 from unittest.mock import MagicMock
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
@@ -291,7 +293,6 @@ def create_sandbox():
     fake_os = FakeOS(fs)
     fake_sys = FakeSys()
     
-    # Берём ВСЕ builtins из настоящего Python
     safe_builtins = {}
     for name in dir(real_builtins):
         if name.startswith('_'):
@@ -299,19 +300,16 @@ def create_sandbox():
         obj = getattr(real_builtins, name)
         safe_builtins[name] = obj
     
-    # Подменяем опасные функции
     safe_builtins['eval'] = SafeEval()
     safe_builtins['exec'] = SafeExec()
     safe_builtins['open'] = fs.open
     safe_builtins['input'] = lambda prompt="": "[SANDBOX INPUT]"
-    safe_builtins['__import__'] = __import__  # оставляем настоящий, но ограничим через sys.modules
     
-    # Настоящие модули (импортируем все что можно)
     import math, random, datetime, time, re, string, itertools, functools, collections
     import statistics, typing, decimal, fractions, hashlib, base64, binascii, inspect
     import textwrap, uuid, html, json, csv, pprint, copy, warnings, traceback, types
     import enum, dataclasses, pathlib, urllib.parse, urllib.request, urllib.error
-    import http.client, socket, ssl, calendar, numbers, fractions, decimal
+    import http.client, socket, ssl, calendar, numbers
     import io as io_module, builtins as builtins_module
     
     real_modules = {
@@ -359,21 +357,18 @@ def create_sandbox():
         'builtins': builtins_module,
     }
     
-    # Пробуем импортировать requests
     try:
         import requests
         real_modules['requests'] = requests
     except:
         pass
     
-    # Пробуем импортировать numpy
     try:
         import numpy
         real_modules['numpy'] = numpy
     except:
         pass
     
-    # Пробуем импортировать pandas
     try:
         import pandas
         real_modules['pandas'] = pandas
@@ -390,7 +385,6 @@ def create_sandbox():
         '__cached__': None,
         '__file__': '/home/sandbox/script.py',
         
-        # Фейковые модули
         'os': fake_os,
         'sys': fake_sys,
         'subprocess': MagicMock(
@@ -407,14 +401,61 @@ def create_sandbox():
             check_call=lambda *a, **k: 0
         ),
         
-        # Настоящие модули
         **real_modules,
     }
     
     return sandbox
 
+# === БУФЕРИЗАЦИЯ ВЫВОДА ===
+class OutputBuffer:
+    def __init__(self):
+        self.chunks = []
+        self.current_chunk = ""
+    
+    def write(self, text):
+        self.current_chunk += str(text)
+        if '\n' in self.current_chunk:
+            lines = self.current_chunk.split('\n')
+            for line in lines[:-1]:
+                self.chunks.append(line + '\n')
+            self.current_chunk = lines[-1]
+    
+    def flush(self):
+        if self.current_chunk:
+            self.chunks.append(self.current_chunk)
+            self.current_chunk = ""
+    
+    def get_output(self):
+        self.flush()
+        return "".join(self.chunks)
+    
+    def get_chunks_for_telegram(self, max_length=4000):
+        self.flush()
+        full_output = self.get_output()
+        
+        if len(full_output) <= max_length:
+            return [full_output] if full_output else ["📭 (пустой вывод)"]
+        
+        chunks = []
+        current = ""
+        for line in self.chunks:
+            if len(current) + len(line) > max_length:
+                if current:
+                    chunks.append(current)
+                current = line
+            else:
+                current += line
+        
+        if current:
+            chunks.append(current)
+        
+        if not chunks:
+            chunks = [full_output[i:i+max_length] for i in range(0, len(full_output), max_length)]
+        
+        return chunks if chunks else ["📭 (пустой вывод)"]
+
 def run_sandbox(code: str) -> dict:
-    output_buffer = io.StringIO()
+    output_buffer = OutputBuffer()
     
     old_stdout = sys.stdout
     old_stderr = sys.stderr
@@ -424,7 +465,8 @@ def run_sandbox(code: str) -> dict:
             output_buffer.write(text)
             old_stdout.write(text)
         def flush(self):
-            pass
+            output_buffer.flush()
+            old_stdout.flush()
     
     sys.stdout = SandboxStdout()
     sys.stderr = SandboxStdout()
@@ -434,29 +476,78 @@ def run_sandbox(code: str) -> dict:
         compiled = compile(code, '<sandbox>', 'exec')
         exec(compiled, sandbox, {})
         
-        output = output_buffer.getvalue().strip()
+        output_buffer.flush()
+        chunks = output_buffer.get_chunks_for_telegram()
         
         return {
             "success": True,
-            "output": output or "📭 (пустой вывод)",
+            "chunks": chunks,
+            "chunk_count": len(chunks),
             "error": None
         }
         
     except SystemExit as e:
+        output_buffer.flush()
+        chunks = output_buffer.get_chunks_for_telegram()
         return {
             "success": True,
-            "output": output_buffer.getvalue().strip(),
+            "chunks": chunks,
+            "chunk_count": len(chunks),
             "error": None
         }
     except Exception as e:
+        output_buffer.flush()
+        chunks = output_buffer.get_chunks_for_telegram()
+        error_msg = f"⚠️ {type(e).__name__}: {str(e)}"
         return {
             "success": False,
-            "output": output_buffer.getvalue().strip(),
-            "error": f"⚠️ {type(e).__name__}: {str(e)}"
+            "chunks": chunks,
+            "chunk_count": len(chunks),
+            "error": error_msg
         }
     finally:
         sys.stdout = old_stdout
         sys.stderr = old_stderr
+
+# === ОТПРАВКА СООБЩЕНИЙ С ЗАДЕРЖКОЙ ===
+async def send_chunks(update, context, chunks, is_error=False):
+    user_id = update.effective_user.id
+    
+    if is_error and len(chunks) == 1 and not chunks[0].strip():
+        chunks = ["📭 (пустой вывод до ошибки)"]
+    
+    for i, chunk in enumerate(chunks):
+        prefix = ""
+        if len(chunks) > 1:
+            prefix = f"📄 Часть {i+1}/{len(chunks)}\n\n"
+        
+        text = prefix + chunk
+        
+        if is_error and i == len(chunks) - 1:
+            continue
+        
+        await context.bot.send_message(chat_id=user_id, text=text, parse_mode=None)
+        
+        if i < len(chunks) - 1:
+            await asyncio.sleep(0.5)
+
+async def send_error(update, context, chunks, error_msg):
+    user_id = update.effective_user.id
+    
+    for i, chunk in enumerate(chunks):
+        prefix = ""
+        if len(chunks) > 1:
+            prefix = f"📄 Часть {i+1}/{len(chunks)}\n\n"
+        
+        text = prefix + chunk
+        
+        if i == len(chunks) - 1:
+            text = text + "\n\n❌ ОШИБКА:\n" + error_msg
+        
+        await context.bot.send_message(chat_id=user_id, text=text, parse_mode=None)
+        
+        if i < len(chunks) - 1:
+            await asyncio.sleep(0.5)
 
 async def execute_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -465,30 +556,54 @@ async def execute_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = run_sandbox(user_code)
     
     if result["success"]:
-        text = (
-            "✅ *Успешно выполнено*\n\n"
+        header = (
+            "✅ Успешно выполнено\n\n"
             "🔧 Метод: 🎭 Mega Sandbox\n"
-            "💻 Код:\n```python\n" + user_code + "\n```\n"
-            "📤 Вывод:\n```\n" + result['output'][:3500] + "\n```"
+            "💻 Код:\n```python\n" + user_code[:1000] + "\n```\n"
+            "📤 Вывод:\n```\n"
         )
+        
+        if result["chunk_count"] == 1:
+            full_text = header + result["chunks"][0] + "\n```"
+            if len(full_text) > 4000:
+                await context.bot.send_message(chat_id=user_id, text=header, parse_mode='Markdown')
+                await asyncio.sleep(0.5)
+                await send_chunks(update, context, result["chunks"])
+            else:
+                await context.bot.send_message(chat_id=user_id, text=full_text, parse_mode='Markdown')
+        else:
+            await context.bot.send_message(chat_id=user_id, text=header, parse_mode='Markdown')
+            await asyncio.sleep(0.5)
+            await send_chunks(update, context, result["chunks"])
     else:
-        text = (
-            "❌ *Ошибка выполнения*\n\n"
+        header = (
+            "❌ Ошибка выполнения\n\n"
             "🔧 Метод: 🎭 Mega Sandbox\n"
-            "💻 Код:\n```python\n" + user_code + "\n```\n"
-            "🚨 Ошибка: `" + result['error'][:1000] + "`"
+            "💻 Код:\n```python\n" + user_code[:1000] + "\n```\n"
+            "📤 Вывод до ошибки:\n```\n"
         )
-    
-    await context.bot.send_message(chat_id=user_id, text=text, parse_mode='Markdown')
+        
+        if result["chunk_count"] == 1:
+            full_text = header + result["chunks"][0] + "\n```\n\n🚨 Ошибка: `" + result["error"] + "`"
+            if len(full_text) > 4000:
+                await context.bot.send_message(chat_id=user_id, text=header, parse_mode='Markdown')
+                await asyncio.sleep(0.5)
+                await send_error(update, context, result["chunks"], result["error"])
+            else:
+                await context.bot.send_message(chat_id=user_id, text=full_text, parse_mode='Markdown')
+        else:
+            await context.bot.send_message(chat_id=user_id, text=header, parse_mode='Markdown')
+            await asyncio.sleep(0.5)
+            await send_error(update, context, result["chunks"], result["error"])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚀 *Mega PySandbox Bot*\n\n"
-        "ВСЕ стандартные модули доступны!\n\n"
+        "🚀 Mega PySandbox Bot\n\n"
+        "Отправь мне Python-код!\n\n"
         "✅ Настоящие: math, random, datetime, re, json, csv, urllib, http, socket, ssl, hashlib, base64, itertools, collections, statistics, typing, decimal, fractions, inspect, textwrap, uuid, html, pprint, copy, warnings, traceback, types, enum, dataclasses, pathlib, calendar, numbers, io, requests(если установлен), numpy(если установлен), pandas(если установлен)\n\n"
         "🎭 Фейковые: os, sys, subprocess, open(память), eval(безопасный), exec(ограниченный)\n\n"
         "💾 Файлы пишутся в ОЗУ, не на диск!",
-        parse_mode='Markdown'
+        parse_mode=None
     )
 
 def main():
