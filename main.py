@@ -128,11 +128,12 @@ class FakeFile:
         self.encoding = encoding
         self.closed = False
         self.position = 0
-        self.is_binary = 'b' in mode
+        self.is_binary = 'b' in self.mode
         
-        if 'a' in mode:
+        # ИСПРАВЛЕНО: Используем self.mode вместо просто mode
+        if 'a' in self.mode:
             self.storage.setdefault(path, b"")
-        elif 'w' in mode:
+        elif 'w' in self.mode:
             self.storage[path] = b""
 
     def write(self, data):
@@ -146,7 +147,9 @@ class FakeFile:
             data = str(data).encode(self.encoding)
             
         old_data = self.storage.get(self.path, b"")
-        if 'a' in mode:
+        
+        # ИСПРАВЛЕНО ТУТ БЫЛО: Используем self.mode вместо просто mode
+        if 'a' in self.mode:
             self.storage[self.path] = old_data + data
         else:
             self.storage[self.path] = data
@@ -400,7 +403,6 @@ def worker_process(code: str, user_timeout: int, result_queue: Queue):
         fake_subprocess = MagicMock(run=lambda *a, **k: MagicMock(returncode=0, stdout='[SANDBOX]', stderr=''))
 
         # 3. Настройка встроенных функций (builtins)
-        # ИСПРАВЛЕНО ДЛЯ DOCKER: real_builtins.__dict__
         safe_builtins = dict(real_builtins.__dict__)
         safe_builtins['open'] = fs.open
         safe_builtins['__import__'] = SafeImport(fake_os, fake_sys, fake_subprocess)
