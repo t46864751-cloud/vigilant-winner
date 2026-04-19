@@ -17,7 +17,10 @@ if DOCKER_AVAILABLE:
 
 if not DOCKER_AVAILABLE:
     from RestrictedPython import compile_restricted
-    from RestrictedPython.Guards import safe_builtins
+    from RestrictedPython.Guards import safe_builtins, full_write_guard
+
+def safe_print(*args, **kwargs):
+    print(*args, **kwargs)
 
 def run_in_docker(code: str) -> dict:
     with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
@@ -55,7 +58,15 @@ def run_in_docker(code: str) -> dict:
 def run_restricted(code: str) -> dict:
     try:
         restricted_globals = {
-            "__builtins__": safe_builtins,
+            "__builtins__": {
+                "True": True, "False": False, "None": None,
+                "str": str, "int": int, "float": float, "bool": bool,
+                "len": len, "range": range, "enumerate": enumerate, "zip": zip,
+                "list": list, "dict": dict, "tuple": tuple, "set": set,
+                "sum": sum, "min": min, "max": max, "abs": abs, "round": round,
+                "type": type, "isinstance": isinstance, "hasattr": hasattr,
+                "print": safe_print,
+            },
             "_getattr_": getattr,
             "_setattr_": setattr,
             "_delattr_": delattr,
@@ -63,6 +74,7 @@ def run_restricted(code: str) -> dict:
             "_setitem_": lambda x, y, z: x.__setitem__(y, z),
             "_iter_unpack_sequence_": lambda x, y: x,
             "_unpack_sequence_": lambda x, y: x,
+            "_print_": safe_print,
         }
         
         bytecode = compile_restricted(code, '<inline>', 'exec')
