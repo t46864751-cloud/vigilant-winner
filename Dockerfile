@@ -2,6 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Устанавливаем Docker CLI и настраиваем доступ
 RUN apt-get update && apt-get install -y \
     apt-transport-https \
     ca-certificates \
