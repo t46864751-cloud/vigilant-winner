@@ -4,84 +4,86 @@ import ast
 import io
 import time
 import builtins as real_builtins
-import types
 import asyncio
 import traceback
 from multiprocessing import Process, Queue
 from unittest.mock import MagicMock
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, MessageHandler, filters, ContextTypes, 
+    CommandHandler, CallbackQueryHandler
+)
 from html import escape
 
 TOKEN = "8608832312:AAGKkMZTYMth41mBqiTqjhSYJypFePgtM0s"
 
-# === КОНФИГУРАЦИЯ ПЕСОЧНИЦЫ ===
-EXECUTION_TIMEOUT = 20  # Секунд на выполнение кода (защита от while True)
+# === КОНФИГУРАЦИЯ ===
+DEFAULT_TIMEOUT = 20
+MAX_TIMEOUT = 45
+MIN_TIMEOUT = 5
+RATE_LIMIT_SECONDS = 4 # Анти-спам: минимальная пауза между запусками
 MAX_TG_MESSAGE_LEN = 4000
-DELAY_BETWEEN_CHUNKS = 0.4  # Задержка между частями вывода, чтобы ТГ не кидал Rate Limit
+DELAY_BETWEEN_CHUNKS = 0.3
 
-# Безопасные переменные окружения (Скрываем реальные токены и пароли от БД)
 SAFE_ENVIRON = {
-    'HOME': '/home/sandbox',
-    'USER': 'sandbox',
-    'PATH': '/usr/local/bin:/usr/bin:/bin',
-    'PWD': '/home/sandbox',
-    'LANG': 'en_US.UTF-8',
-    'SHELL': '/bin/bash',
-    'SANDBOX': 'true'
+    'HOME': '/home/sandbox', 'USER': 'sandbox', 'PATH': '/usr/local/bin:/usr/bin:/bin',
+    'PWD': '/home/sandbox', 'LANG': 'en_US.UTF-8', 'SHELL': '/bin/bash', 'SANDBOX': 'true'
 }
 
-# Список модулей, которым разрешено использовать НАСТОЯЩУЮ СЕТЬ и вычисления
 ALLOWED_REAL_MODULES = {
-    # Стандартная библиотека (Вычисления)
     'math', 'random', 'datetime', 'time', 're', 'string', 'itertools', 'functools',
     'collections', 'statistics', 'typing', 'decimal', 'fractions', 'hashlib',
     'base64', 'binascii', 'inspect', 'textwrap', 'uuid', 'html', 'json', 'csv',
     'pprint', 'copy', 'warnings', 'traceback', 'types', 'enum', 'dataclasses',
     'pathlib', 'calendar', 'numbers', 'io', 'builtins', 'threading', 'logging',
     'sqlite3', 'email', 'xml', 'zipfile', 'tarfile', 'gzip', 'bz2', 'lzma',
-    'secrets', 'string', 'struct', 'ctypes',
-    
-    # Сетевые (Настоящие сокеты и запросы)
-    'socket', 'ssl', 'urllib', 'http', 'ftplib', 'smtplib', 'imaplib',
-    
-    # Асинхронность
-    'asyncio', 'concurrent', 'multiprocessing',
-    
-    # Сторонние (Добавляй сюда то, что установлено через pip на сервере)
-    'requests', 'aiohttp', 'telebot', 'pyTelegramBotAPI',
-    'aiogram', 'numpy', 'pandas', 'flask', 'fastapi', 'bs4', 'lxml',
-    'pydantic', 'certifi', 'charset_normalizer', 'idna', 'urllib3'
+    'secrets', 'struct', 'ctypes', 'socket', 'ssl', 'urllib', 'http', 'ftplib',
+    'smtplib', 'imaplib', 'asyncio', 'concurrent', 'multiprocessing',
+    'requests', 'aiohttp', 'telebot', 'pyTelegramBotAPI', 'aiogram', 'numpy',
+    'pandas', 'flask', 'fastapi', 'bs4', 'lxml', 'pydantic', 'certifi',
+    'charset_normalizer', 'idna', 'urllib3', 'PIL', 'pillow', 'matplotlib'
 }
 
+# =====================================================================
+# === БАЗА ДАННЫХ ПОЛЬЗОВАТЕЛЕЙ (В ПАМЯТИ) ===========================
+# =====================================================================
+class UserProfile:
+    def __init__(self, user_id):
+        self.user_id = user_id
+        self.timeout = DEFAULT_TIMEOUT
+        self.last_run_time = 0
+        self.run_count = 0
+
+USER_DB = {} # {user_id: UserProfile}
+# Временное хранилище сгенерированных файлов (чтобы кнопки скачивания работали)
+# Структура: {user_id: {"files": {filename: bytes}, "map": {button_id: filename}}}
+FILES_DB = {}
+
+def get_user(user_id):
+    if user_id not in USER_DB:
+        USER_DB[user_id] = UserProfile(user_id)
+    return USER_DB[user_id]
 
 # =====================================================================
-# === БЕЗОПАСНОСТЬ НА УРОВНЕ AST (Защита от хитрых хакеров) ==========
+# === БЕЗОПАСНОСТЬ AST =================================================
 # =====================================================================
 class SecurityAstVisitor(ast.NodeVisitor):
-    """
-    Парсит дерево кода ДО выполнения.
-    Блокирует: import os, eval(''), getattr(__builtins__, ...) и т.д.
-    """
     FORBIDDEN_BUILTINS = {'eval', 'exec', 'compile', 'breakpoint', '__import__'}
-
     def visit_Import(self, node):
         for alias in node.names:
             base_name = alias.name.split('.')[0]
             if base_name not in ALLOWED_REAL_MODULES and base_name not in ['os', 'sys', 'subprocess']:
-                raise ImportError(f"🚫 [AST SECURITY] Запрещен импорт: '{alias.name}'")
+                raise ImportError(f"🚫 Запрещен импорт: '{alias.name}'")
         self.generic_visit(node)
-
     def visit_ImportFrom(self, node):
         if node.module:
             base_name = node.module.split('.')[0]
             if base_name not in ALLOWED_REAL_MODULES and base_name not in ['os', 'sys', 'subprocess']:
-                raise ImportError(f"🚫 [AST SECURITY] Запрещен импорт из: '{node.module}'")
+                raise ImportError(f"🚫 Запрещен импорт из: '{node.module}'")
         self.generic_visit(node)
-
     def visit_Call(self, node):
         if isinstance(node.func, ast.Name) and node.func.id in self.FORBIDDEN_BUILTINS:
-            raise NameError(f"🚫 [AST SECURITY] Вызов '{node.func.id}' заблокирован")
+            raise NameError(f"🚫 Вызов '{node.func.id}' заблокирован")
         self.generic_visit(node)
 
 def check_ast_security(code: str):
@@ -91,12 +93,10 @@ def check_ast_security(code: str):
     except SyntaxError as e:
         raise SyntaxError(f"Синтаксическая ошибка: {e}")
 
-
 # =====================================================================
-# === ФЕЙКОВАЯ ФАЙЛОВАЯ СИСТЕМА (Всё в оперативной памяти) ============
+# === ФЕЙКОВАЯ ФАЙЛОВАЯ СИСТЕМА (ПОДДЕРЖКА БИНАРНЫХ ФАЙЛОВ/КАРТИНОК) =
 # =====================================================================
 class FakeFile:
-    """Максимально полная эмуляция файлового объекта"""
     def __init__(self, path, fs_storage, mode='r', encoding='utf-8'):
         self.path = path
         self.storage = fs_storage
@@ -104,86 +104,86 @@ class FakeFile:
         self.encoding = encoding
         self.closed = False
         self.position = 0
+        self.is_binary = 'b' in mode
         
         if 'a' in mode:
-            self.storage.setdefault(path, "")
+            self.storage.setdefault(path, b"")
         elif 'w' in mode:
-            self.storage[path] = ""
+            self.storage[path] = b""
 
     def write(self, data):
         if 'r' in self.mode and '+' not in self.mode:
             raise IOError("Файл открыт только для чтения")
-        data_str = str(data)
-        self.storage[self.path] += data_str
-        return len(data_str)
+        
+        # Поддерживаем запись как строк, так и байтов (для PIL и картинок)
+        if isinstance(data, str):
+            data = data.encode(self.encoding)
+        elif not isinstance(data, bytes):
+            data = str(data).encode(self.encoding)
+            
+        old_data = self.storage.get(self.path, b"")
+        if 'a' in mode:
+            self.storage[self.path] = old_data + data
+        else:
+            self.storage[self.path] = data
+        return len(data)
 
     def read(self, size=-1):
-        content = self.storage.get(self.path, "")
-        if size == -1:
-            res = content[self.position:]
-            self.position = len(content)
-            return res
-        result = content[self.position:self.position + size]
-        self.position += len(result)
-        return result
+        content = self.storage.get(self.path, b"")
+        if self.is_binary:
+            if size == -1:
+                res = content[self.position:]
+                self.position = len(content)
+                return res
+            result = content[self.position:self.position + size]
+            self.position += len(result)
+            return result
+        else:
+            text_content = content.decode(self.encoding, errors='replace')
+            if size == -1:
+                res = text_content[self.position:]
+                self.position = len(text_content)
+                return res
+            result = text_content[self.position:self.position + size]
+            self.position += len(result)
+            return result
 
     def readline(self):
-        content = self.storage.get(self.path, "")
-        nl_pos = content.find('\n', self.position)
+        content = self.read()
+        nl_pos = content.find('\n')
         if nl_pos != -1:
-            res = content[self.position:nl_pos+1]
-            self.position = nl_pos + 1
-            return res
-        res = content[self.position:]
-        self.position = len(content)
-        return res
+            self.position -= (len(content) - nl_pos - 1)
+            return content[:nl_pos+1]
+        return content
 
-    def readlines(self):
-        return self.read().splitlines(keepends=True)
-
+    def readlines(self): return self.read().splitlines(keepends=True)
     def seek(self, pos, whence=0):
         if whence == 0: self.position = pos
         elif whence == 1: self.position += pos
-        elif whence == 2: self.position = len(self.storage.get(self.path, "")) + pos
-
     def tell(self): return self.position
     def flush(self): pass
     def close(self): self.closed = True
     def readable(self): return 'r' in self.mode
     def writable(self): return 'w' in self.mode or 'a' in self.mode or '+' in self.mode
     def seekable(self): return True
-    
     def __iter__(self):
         while True:
             line = self.readline()
             if not line: break
             yield line
-            
     def __enter__(self): return self
     def __exit__(self, *args): self.close()
 
-
 class FakeFileSystem:
     def __init__(self):
-        self.files = {}
-        
+        self.files = {} # Хранит ТОЛЬКО байты! {path: bytes}
     def open(self, path, mode='r', *args, **kwargs):
         return FakeFile(str(path), self.files, mode, kwargs.get('encoding', 'utf-8'))
 
-    def exists(self, path): return str(path) in self.files
-    def remove(self, path): self.files.pop(str(path), None)
-    def unlink(self, path): self.remove(path)
-    def rename(self, src, dst):
-        if str(src) in self.files:
-            self.files[str(dst)] = self.files.pop(str(src))
-    def getcwd(self): return "/home/sandbox"
-
-
 # =====================================================================
-# === ФЕЙКОВЫЕ СИСТЕМНЫЕ МОДУЛИ (Docker-эмуляция) ====================
+# === ФЕЙКОВЫЕ СИСТЕМНЫЕ МОДУЛИ =======================================
 # =====================================================================
 class FakePath:
-    """Полная заглушка для os.path, чтобы не крашились сторонние либы"""
     def __init__(self, fs):
         self.fs = fs
         self.sep = '/'
@@ -191,9 +191,8 @@ class FakePath:
         self.extsep = '.'
         self.curdir = '.'
         self.pardir = '..'
-        
     def join(self, *args): return os.path.join(*args)
-    def exists(self, p): return self.fs.exists(p)
+    def exists(self, p): return str(p) in self.fs.files
     def isfile(self, p): return self.fs.exists(p)
     def isdir(self, p): return False
     def abspath(self, p): return f"/home/sandbox/{p}"
@@ -205,14 +204,11 @@ class FakePath:
         p = str(p)
         if '.' in p: return (p[:p.rfind('.')], p[p.rfind('.'):])
         return (p, '')
-    def getsize(self, p): return len(self.fs.files.get(str(p), ""))
+    def getsize(self, p): return len(self.fs.files.get(str(p), b""))
     def normpath(self, p): return os.path.normpath(p)
     def isabs(self, p): return str(p).startswith('/')
     def expanduser(self, p): return p.replace('~', '/home/sandbox')
-    
-    def __getattr__(self, name):
-        return MagicMock(return_value=f"/fake/path/{name}")
-
+    def __getattr__(self, name): return MagicMock(return_value=f"/fake/path/{name}")
 
 class FakeOS:
     def __init__(self, fs):
@@ -223,36 +219,29 @@ class FakeOS:
         self.linesep = '\n'
         self.pathsep = ':'
         self.devnull = '/dev/null'
-        self.path = FakePath(fs) # Критически важно для работы urllib/requests внутри песочницы
+        self.path = FakePath(fs)
 
     def system(self, command): return f"[SANDBOX BLOCKED] os.system('{command}')"
     def popen(self, *a, **k): return MagicMock(read=lambda: "[SANDBOX]", readline=lambda: "", close=lambda: None)
-    
-    def listdir(self, path='.'): return ['sandbox_files_are_in_ram']
+    def listdir(self, path='.'): return list(self.fs.files.keys())
     def mkdir(self, p, *a, **k): pass
     def makedirs(self, p, *a, **k): pass
-    def remove(self, p): self.fs.remove(p)
-    def unlink(self, p): self.fs.remove(p)
-    def rename(self, s, d): self.fs.rename(s, d)
-    def replace(self, s, d): self.fs.rename(s, d)
+    def remove(self, p): self.fs.files.pop(str(p), None)
+    def unlink(self, p): self.remove(p)
+    def rename(self, s, d):
+        if str(s) in self.fs.files: self.fs.files[str(d)] = self.fs.files.pop(str(s))
     def getcwd(self): return "/home/sandbox"
     def chdir(self, p): pass
     def getpid(self): return 99999
     def getppid(self): return 1
     def getuid(self): return 1000
-    def getgid(self): return 1000
     def urandom(self, n):
-        import random
-        return bytes(random.randint(0, 255) for _ in range(n))
-    
-    def getenv(self, key, default=""):
-        return SAFE_ENVIRON.get(key, default)
-        
+        import random; return bytes(random.randint(0, 255) for _ in range(n))
+    def getenv(self, key, default=""): return SAFE_ENVIRON.get(key, default)
     def __getattr__(self, name):
-        if name in ['fork', 'kill', 'spawnl', 'spawnv', 'execv', 'execve', 'system']:
+        if name in ['fork', 'kill', 'spawnl', 'spawnv', 'execv', 'execve']:
             return MagicMock(return_value="[SANDBOX BLOCKED CRITICAL SYS CALL]")
         return MagicMock(return_value=f"[SANDBOX BLOCKED os.{name}]")
-
 
 class FakeSys:
     def __init__(self):
@@ -262,24 +251,14 @@ class FakeSys:
         self.version = "3.11.0 (Secure Sandbox Edition)"
         self.version_info = (3, 11, 0, 'final', 0)
         self.platform = "linux"
-        self.byteorder = "little"
-        self.maxsize = 9223372036854775807
-        self.path = ['/home/sandbox', '/usr/lib/python311.zip']
+        self.path = ['/home/sandbox']
         self.modules = {}
         self.argv = ['sandbox.py']
-        self.executable = '/usr/bin/python3'
-        self.prefix = '/usr'
-        self.exec_prefix = '/usr'
-    
-    def exit(self, arg=0):
-        raise SystemExit(f"[SANDBOX] exit({arg}) вызван")
-        
-    def __getattr__(self, name):
-        return MagicMock(return_value=f"[SANDBOX BLOCKED sys.{name}]")
-
+    def exit(self, arg=0): raise SystemExit(f"[SANDBOX] exit({arg}) вызван")
+    def __getattr__(self, name): return MagicMock(return_value=f"[SANDBOX BLOCKED sys.{name}]")
 
 # =====================================================================
-# === УМНЫЙ ИМПОРТ (Gatekeeper Сети и Системы) ========================
+# === УМНЫЙ ИМПОРТ ====================================================
 # =====================================================================
 class SafeImport:
     def __init__(self, fake_os, fake_sys, fake_subprocess):
@@ -289,264 +268,351 @@ class SafeImport:
 
     def __call__(self, name, globals=None, locals=None, fromlist=(), level=0):
         base_name = name.split('.')[0]
-        
-        # 1. Подмена системных модулей (Безопасность)
         if base_name == 'os': return self.fake_os
         if base_name == 'sys': return self.fake_sys
         if base_name == 'subprocess': return self.fake_subprocess
-        if base_name == 'shutil': return MagicMock() # shutil часто используется для удаления файлов
+        if base_name == 'shutil': return MagicMock()
         
-        # 2. Выдача настоящих модулей (Сеть и Вычисления)
         if base_name in ALLOWED_REAL_MODULES:
             try:
                 return real_builtins.__import__(name, globals, locals, fromlist, level)
             except ImportError as e:
                 raise ImportError(f"Модуль '{name}' разрешен, но не установлен на сервере! ({e})")
         
-        # 3. Блокировка всего остального
-        raise ImportError(f"🚫 [SANDBOX] Импорт модуля '{name}' жестко заблокирован!")
-
+        raise ImportError(f"🚫 [SANDBOX] Импорт модуля '{name}' заблокирован!")
 
 # =====================================================================
-# === ИЗОЛИРОВАННЫЙ РАБОЧИЙ ПРОЦЕСС (Ядро Песочницы) =================
+# === ИЗОЛИРОВАННЫЙ РАБОЧИЙ ПРОЦЕСС ===================================
 # =====================================================================
-def worker_process(code: str, result_queue: Queue):
-    """
-    Запускается в ОТДЕЛЬНОМ процессе ОС.
-    Имеет доступ к сети, но сидит в клетке из фейковых os/sys/open.
-    """
+def worker_process(code: str, user_timeout: int, result_queue: Queue):
     old_stdout = sys.stdout
     old_stderr = sys.stderr
     buffer = io.StringIO()
+    start_time = time.time()
 
     try:
         sys.stdout = buffer
         sys.stderr = buffer
 
-        # 1. Проверка кода AST-парсером до выполнения
         check_ast_security(code)
 
-        # 2. Создание изолированного окружения
         fs = FakeFileSystem()
         fake_os = FakeOS(fs)
         fake_sys = FakeSys()
-        fake_subprocess = MagicMock(
-            run=lambda *a, **k: MagicMock(returncode=0, stdout='[SANDBOX]', stderr=''),
-            Popen=lambda *a, **k: MagicMock(communicate=lambda: (b'[SANDBOX]', b''), wait=lambda: 0),
-            call=lambda *a, **k: 0,
-            check_output=lambda *a, **k: b'[SANDBOX]'
-        )
+        fake_subprocess = MagicMock(run=lambda *a, **k: MagicMock(returncode=0, stdout='[SANDBOX]', stderr=''))
 
-        # 3. Настройка встроенных функций (builtins)
         safe_builtins = dict(real_builtins)
         safe_builtins['open'] = fs.open
         safe_builtins['__import__'] = SafeImport(fake_os, fake_sys, fake_subprocess)
         safe_builtins['input'] = lambda prompt="": "[SANDBOX INPUT]"
-        
-        # Жесткая блокировка опасных вызовов через builtins
         safe_builtins['eval'] = lambda *a, **k: exec("[SANDBOX] eval() заблокирован")
         safe_builtins['exec'] = lambda *a, **k: exec("[SANDBOX] exec() заблокирован")
-        safe_builtins['compile'] = lambda *a, **k: exec("[SANDBOX] compile() заблокирован")
 
         sandbox_globals = {
-            '__builtins__': safe_builtins,
-            '__name__': '__main__',
-            '__doc__': None,
-            '__package__': None,
-            '__spec__': None,
-            '__file__': '/home/sandbox/script.py',
-            'os': fake_os,
-            'sys': fake_sys,
-            'subprocess': fake_subprocess,
+            '__builtins__': safe_builtins, '__name__': '__main__', '__doc__': None,
+            'os': fake_os, 'sys': fake_sys, 'subprocess': fake_subprocess,
         }
 
-        # 4. Выполнение
         compiled = compile(code, '<sandbox>', 'exec')
         exec(compiled, sandbox_globals, {})
 
-        result_queue.put({"success": True, "output": buffer.getvalue(), "error": None})
+        exec_time = round(time.time() - start_time, 4)
+        # Возвращаем текстовый вывод и СЛОВАРЬ СОЗДАННЫХ ФАЙЛОВ (в байтах)
+        result_queue.put({
+            "success": True, "output": buffer.getvalue(), "error": None,
+            "files": fs.files, "exec_time": exec_time
+        })
 
     except SystemExit:
-        result_queue.put({"success": True, "output": buffer.getvalue(), "error": None})
+        result_queue.put({"success": True, "output": buffer.getvalue(), "error": None, "files": {}, "exec_time": 0})
     except Exception as e:
+        exec_time = round(time.time() - start_time, 4)
         result_queue.put({
-            "success": False, 
-            "output": buffer.getvalue(), 
-            "error": f"{type(e).__name__}: {str(e)}\n\n{traceback.format_exc()}"
+            "success": False, "output": buffer.getvalue(),
+            "error": f"{type(e).__name__}: {str(e)}\n\n{traceback.format_exc()}",
+            "files": {}, "exec_time": exec_time
         })
     finally:
         sys.stdout = old_stdout
         sys.stderr = old_stderr
 
-
-def run_sandbox(code: str) -> dict:
-    """Запускает процесс, ждет результат, убивает при зависании."""
+def run_sandbox(code: str, timeout: int) -> dict:
     result_queue = Queue()
-    process = Process(target=worker_process, args=(code, result_queue))
+    process = Process(target=worker_process, args=(code, timeout, result_queue))
     
     process.start()
-    process.join(timeout=EXECUTION_TIMEOUT)
+    process.join(timeout=timeout)
     
     if process.is_alive():
         process.terminate()
         process.join(timeout=1)
         if process.is_alive():
-            process.kill() # SIGKILL
+            process.kill()
             process.join()
-            
         return {
-            "success": False,
-            "output": "",
-            "error": f"⏳ ТАЙМАУТ ({EXECUTION_TIMEOUT}с). Процесс уничтожен.\n(Запрещено использовать: while True, bot.polling(), bot.infinity_polling())"
+            "success": False, "output": "", "files": {},
+            "error": f"⏳ ТАЙМАУТ ({timeout}с). Процесс уничтожен.", "exec_time": timeout
         }
     
     if not result_queue.empty():
         return result_queue.get()
-    return {"success": False, "output": "", "error": "Процесс завершился без ответа."}
-
+    return {"success": False, "output": "", "error": "Процесс упал без объяснения.", "files": {}, "exec_time": 0}
 
 # =====================================================================
-# === ТЕЛЕГРАМ-УТИЛИТЫ (Буферизация и Красивый Вывод) ================
+# === УТИЛИТЫ ОТПРАВКИ СООБЩЕНИЙ ======================================
 # =====================================================================
 class OutputBuffer:
-    """Собирает вывод построчно для красивой разбивки по сообщениям"""
     def __init__(self):
         self.chunks = []
         self.current_chunk = ""
-
     def write(self, text):
         self.current_chunk += str(text)
         while '\n' in self.current_chunk:
             line, self.current_chunk = self.current_chunk.split('\n', 1)
             self.chunks.append(line + '\n')
-
     def flush(self):
         if self.current_chunk:
             self.chunks.append(self.current_chunk)
             self.current_chunk = ""
-
     def get_chunks_for_telegram(self):
         self.flush()
-        if not self.chunks:
-            return ["📭 (пустой вывод)"]
-
-        result_parts = []
-        current_part = ""
-
+        if not self.chunks: return ["📭 (пустой вывод)"]
+        result_parts, current_part = [], ""
         for chunk in self.chunks:
-            if len(current_part) + len(chunk) > MAX_TG_MESSAGE_LEN - 200: # Запас для HTML тегов
-                if current_part:
-                    result_parts.append(current_part)
+            if len(current_part) + len(chunk) > MAX_TG_MESSAGE_LEN - 200:
+                if current_part: result_parts.append(current_part)
                 current_part = chunk
             else:
                 current_part += chunk
-
-        if current_part:
-            result_parts.append(current_part)
-
+        if current_part: result_parts.append(current_part)
         return result_parts if result_parts else ["📭 (пустой вывод)"]
 
-
-async def send_chunks(update, context, chunks, is_error=False):
-    user_id = update.effective_user.id
+async def send_text_chunks(user_id, context, chunks, error_msg=None):
     for i, chunk in enumerate(chunks):
         prefix = f"📄 Часть {i+1}/{len(chunks)}\n\n" if len(chunks) > 1 else ""
         text = prefix + "<code>" + escape(chunk) + "</code>"
         
+        if error_msg and i == len(chunks) - 1:
+            text += "\n\n🚨 <b>Ошибка:</b>\n<code>" + escape(error_msg[:1500]) + "</code>"
+            
         if len(text) > MAX_TG_MESSAGE_LEN:
-            text = text[:MAX_TG_MESSAGE_LEN - 50] + "\n\n... [Обрезано по лимиту ТГ]"
+            text = text[:MAX_TG_MESSAGE_LEN - 50] + "\n\n... [Обрезано]"
             
         await context.bot.send_message(chat_id=user_id, text=text, parse_mode='HTML')
         if i < len(chunks) - 1:
             await asyncio.sleep(DELAY_BETWEEN_CHUNKS)
-
-
-async def send_error(update, context, chunks, error_msg):
-    user_id = update.effective_user.id
-    for i, chunk in enumerate(chunks):
-        prefix = f"📄 Часть {i+1}/{len(chunks)}\n\n" if len(chunks) > 1 else ""
-        text = prefix + "<code>" + escape(chunk) + "</code>"
-        
-        # К последнему куску приклеиваем ошибку
-        if i == len(chunks) - 1:
-            text += "\n\n🚨 <b>Ошибка выполнения:</b>\n<code>" + escape(error_msg[:1500]) + "</code>"
-            
-        if len(text) > MAX_TG_MESSAGE_LEN:
-            text = text[:MAX_TG_MESSAGE_LEN - 50] + "\n\n... [Обрезано по лимиту ТГ]"
-            
-        await context.bot.send_message(chat_id=user_id, text=text, parse_mode='HTML')
-        if i < len(chunks) - 1:
-            await asyncio.sleep(DELAY_BETWEEN_CHUNKS)
-
 
 # =====================================================================
-# === ХЭНДЛЕРЫ ТЕЛЕГРАМ-БОТА =========================================
+# === ГЛАВНЫЕ ХЭНДЛЕРЫ ТЕЛЕГРАМ-БОТА =================================
 # =====================================================================
 async def execute_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    user = get_user(user_id)
     user_code = update.message.text
     
-    wait_msg = await update.message.reply_text("🐳 Запуск Docker-подобной песочницы...")
-    
-    result = run_sandbox(user_code)
-    
-    try:
-        await wait_msg.delete()
-    except:
-        pass
+    # 1. АНТИ-СПАМ ЗАЩИТА
+    current_time = time.time()
+    if current_time - user.last_run_time < RATE_LIMIT_SECONDS:
+        wait_sec = round(RATE_LIMIT_SECONDS - (current_time - user.last_run_time), 1)
+        await update.message.reply_text(f"⏳ Анти-спам. Подождите {wait_sec} сек. перед следующим запуском.")
+        return
+    user.last_run_time = current_time
+    user.run_count += 1
 
-    # Формируем красивый заголовок
-    safe_code_preview = escape(user_code[:600]) + ("..." if len(user_code) > 600 else "")
+    wait_msg = await update.message.reply_text("🐳 Запуск изолированного контейнера...")
+    result = run_sandbox(user_code, user.timeout)
+    
+    try: await wait_msg.delete()
+    except: pass
+
+    # 2. ОБРАБОТКА СГЕНЕРИРОВАННЫХ ФАЙЛОВ (Кнопки скачивания)
+    reply_markup = None
+    if result.get("files"):
+        # Сохраняем файлы в глобальную RAM-базу для кнопок
+        FILES_DB[user_id] = {"files": result["files"], "map": {}}
+        buttons = []
+        for idx, filename in enumerate(result["files"].keys()):
+            btn_id = f"dl_{idx}"
+            FILES_DB[user_id]["map"][btn_id] = filename
+            # Обрезаем длинные имена для кнопки
+            display_name = filename if len(filename) <= 30 else "..." + filename[-27:]
+            buttons.append([InlineKeyboardButton(f"📂 Скачать {display_name}", callback_data=btn_id)])
+        
+        reply_markup = InlineKeyboardMarkup(buttons)
+
+    # 3. ФОРМИРОВАНИЕ ТЕКСТА ОТВЕТА
+    safe_code_preview = escape(user_code[:500]) + ("..." if len(user_code) > 500 else "")
+    status = "✅ Успешно" if result["success"] else "❌ Ошибка/Таймаут"
+    time_info = f"⏱ За {result['exec_time']}с | Лимит: {user.timeout}с"
+    
     header = (
-        "✅ <b>Успешно выполнено</b>\n"
-        "🔧 <i>Метод: Secure Network Sandbox</i>\n\n"
+        f"<b>{status}</b> | {time_info}\n"
+        "─────────────────────\n"
         f"💻 <b>Код:</b>\n<code>{safe_code_preview}</code>\n\n"
+        "─────────────────────\n"
         "📤 <b>Вывод:</b>\n"
-    ) if result["success"] else (
-        "❌ <b>Ошибка / Таймаут</b>\n"
-        "🔧 <i>Метод: Secure Network Sandbox</i>\n\n"
-        f"💻 <b>Код:</b>\n<code>{safe_code_preview}</code>\n\n"
-        "📤 <b>Вывод до ошибки:</b>\n"
     )
 
-    # Парсим вывод через буфер
     out_buf = OutputBuffer()
     out_buf.write(result["output"])
     chunks = out_buf.get_chunks_for_telegram()
 
-    # Отправляем заголовок отдельно
     try:
         await context.bot.send_message(chat_id=user_id, text=header, parse_mode='HTML')
         await asyncio.sleep(0.2)
+        await send_text_chunks(user_id, context, chunks, None if result["success"] else result["error"])
+        
+        # Если есть файлы, отправляем сообщение с кнопками
+        if reply_markup:
+            await context.bot.send_message(
+                chat_id=user_id, 
+                text="📁 <b>Скрипт создал файлы. Нажмите для скачивания:</b>", 
+                reply_markup=reply_markup,
+                parse_mode='HTML'
+            )
     except Exception as e:
-        await context.bot.send_message(chat_id=user_id, text="Ошибка форматирования заголовка", parse_mode=None)
+        await context.bot.send_message(chat_id=user_id, text=f"Ошибка рендера: {e}")
 
-    # Отправляем части вывода
-    if result["success"]:
-        await send_chunks(update, context, chunks)
-    else:
-        await send_error(update, context, chunks, result["error"])
-
+# =====================================================================
+# === ИНТЕРФЕЙС: ГЛАВНОЕ МЕНЮ, НАСТРОЙКИ, ПРОФИЛЬ ====================
+# =====================================================================
+def get_main_menu():
+    keyboard = [
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="menu_settings"),
+         InlineKeyboardButton("👤 Мой профиль", callback_data="menu_profile")],
+        [InlineKeyboardButton("❓ Как пользоваться", callback_data="menu_help")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🐳 <b>Mega PySandbox Bot (Giga Docker Edition)</b>\n\n"
-        "Отправь мне Python-код!\n\n"
-        "✅ <b>Сеть РЕАЛЬНАЯ:</b> <code>requests</code>, <code>telebot</code>, <code>aiogram</code>, <code>aiohttp</code>, <code>socket</code>, <code>sqlite3</code> и многое другое.\n"
-        "🔐 <b>Система ФЕЙКОВАЯ:</b> <code>os</code>, <code>sys</code>, <code>subprocess</code> подменены. Хакер не сможет прочитать твои токены, удалить файлы или убить процессы.\n"
-        "💾 <b>Файлы в RAM:</b> <code>open()</code> пишет и читает только из оперативной памяти.\n"
-        "🛡️ <b>Защита от зависаний:</b> Бесконечные циклы и <code>bot.infinity_polling()</code> убиваются через 20 секунд.\n"
-        "🧠 <b>Защита от инъекций:</b> AST-парсер блокирует обход через <code>eval</code> и <code>getattr</code>.\n\n"
-        "<i>Пример: <code>import requests; print(requests.get('https://api.ipify.org').text)</code></i>",
-        parse_mode='HTML'
+    text = (
+        "🐳 <b>Mega PySandbox Bot</b>\n\n"
+        "Отправь мне Python-код, и я выполню его в безопасном контейнере с доступом к интернету.\n"
+        "Ты можешь создавать файлы, картинки (PIL) и скачивать их!"
     )
+    await update.message.reply_text(text, reply_markup=get_main_menu(), parse_mode='HTML')
 
+async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer() # Убираем часики на кнопке
+    user_id = query.from_user.id
+    user = get_user(user_id)
+    data = query.data
+
+    if data == "menu_settings":
+        kb = [
+            [InlineKeyboardButton(f"⏱ Текущий таймаут: {user.timeout} сек", callback_data="none")],
+            [
+                InlineKeyboardButton("➖ 5 сек", callback_data="set_timeout_-5"),
+                InlineKeyboardButton("➕ 5 сек", callback_data="set_timeout_+5")
+            ],
+            [InlineKeyboardButton("🔙 Назад", callback_data="menu_back")]
+        ]
+        text = "⚙️ <b>Настройки контейнера</b>\n\nУстанавливай таймаут выполнения кода (макс. 45 сек). Полезно для сложных парсеров."
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+
+    elif data.startswith("set_timeout_"):
+        change = int(data.split("_")[2])
+        new_timeout = user.timeout + change
+        new_timeout = max(MIN_TIMEOUT, min(MAX_TIMEOUT, new_timeout))
+        user.timeout = new_timeout
+        
+        # Обновляем сообщение с новыми значениями
+        kb = [
+            [InlineKeyboardButton(f"⏱ Текущий таймаут: {user.timeout} сек", callback_data="none")],
+            [
+                InlineKeyboardButton("➖ 5 сек", callback_data="set_timeout_-5"),
+                InlineKeyboardButton("➕ 5 сек", callback_data="set_timeout_+5")
+            ],
+            [InlineKeyboardButton("🔙 Назад", callback_data="menu_back")]
+        ]
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(kb))
+
+    elif data == "menu_profile":
+        username = query.from_user.username or "Не задан"
+        text = (
+            "👤 <b>Твой профиль в песочнице</b>\n\n"
+            f"🆔 ID: <code>{user_id}</code>\n"
+            f"📛 Юзернейм: @{escape(username)}\n"
+            f"⏱ Личный таймаут: {user.timeout} сек\n"
+            f"🚀 Запусков выполнено: {user.run_count}\n"
+            f"📁 Файлов в буфере: {len(FILES_DB.get(user_id, {}).get('files', {}))}"
+        )
+        kb = [[InlineKeyboardButton("🔙 Назад", callback_data="menu_back")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+
+    elif data == "menu_help":
+        text = (
+            "❓ <b>Инструкция</b>\n\n"
+            "1. Просто пиши код в чат.\n"
+            "2. Сеть работает: <code>import requests</code>.\n"
+            "3. Система фейковая: <code>os.system()</code> заблокировано.\n"
+            "4. Файлы пишутся в ОЗУ:\n"
+            "   <code>f = open('test.txt', 'w'); f.write('Hi')</code>\n"
+            "5. Если скрипт создает файл (или картинку через PIL), под выводом появится кнопка для скачивания!\n"
+            "6. Не используй <code>while True</code> или бот зависнет и упадет по таймауту."
+        )
+        kb = [[InlineKeyboardButton("🔙 Назад", callback_data="menu_back")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+
+    elif data == "menu_back":
+        text = (
+            "🐳 <b>Mega PySandbox Bot</b>\n\n"
+            "Отправь мне Python-код, и я выполню его в безопасном контейнере с доступом к интернету."
+        )
+        await query.edit_message_text(text, reply_markup=get_main_menu(), parse_mode='HTML')
+
+    elif data.startswith("dl_"):
+        # ОБРАБОТКА СКАЧИВАНИЯ ФАЙЛОВ
+        if user_id not in FILES_DB:
+            await query.answer("Файлы устарели. Запусти скрипт заново.", show_alert=True)
+            return
+            
+        file_map = FILES_DB[user_id].get("map", {})
+        files_data = FILES_DB[user_id].get("files", {})
+        
+        filename = file_map.get(data)
+        if not filename or filename not in files_data:
+            await query.answer("Файл не найден.", show_alert=True)
+            return
+            
+        file_bytes = files_data[filename]
+        
+        # Уведомляем пользователя
+        await query.answer("📎 Отправляю файл...", show_alert=False)
+        
+        try:
+            # Определяем, картинка это или документ
+            ext = filename.lower().split('.')[-1] if '.' in filename else ""
+            is_image = ext in ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']
+            
+            if is_image:
+                await context.bot.send_photo(
+                    chat_id=user_id, 
+                    photo=io.BytesIO(file_bytes), 
+                    caption=f"🖼 Изображение: {escape(filename)}"
+                )
+            else:
+                await context.bot.send_document(
+                    chat_id=user_id, 
+                    document=io.BytesIO(file_bytes), 
+                    filename=filename
+                )
+        except Exception as e:
+            await context.bot.send_message(chat_id=user_id, text=f"❌ Ошибка отправки файла: {e}")
+
+# =====================================================================
+# === ЗАПУСК ===========================================================
+# =====================================================================
 def main():
     app = Application.builder().token(TOKEN).build()
+    
+    # Роутинг
     app.add_handler(CommandHandler('start', start))
+    app.add_handler(CallbackQueryHandler(menu_callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, execute_code))
     
-    print("Бот запущен. Нажми Ctrl+C для остановки.")
+    print("🐳 Mega PySandbox Bot запущен. Нажми Ctrl+C для остановки.")
     app.run_polling()
 
 if __name__ == "__main__":
