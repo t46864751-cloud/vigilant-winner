@@ -21,7 +21,7 @@ TOKEN = "8608832312:AAGKkMZTYMth41mBqiTqjhSYJypFePgtM0s"
 DEFAULT_TIMEOUT = 20
 MAX_TIMEOUT = 45
 MIN_TIMEOUT = 5
-RATE_LIMIT_SECONDS = 4 # Анти-спам: минимальная пауза между запусками
+RATE_LIMIT_SECONDS = 4
 MAX_TG_MESSAGE_LEN = 4000
 DELAY_BETWEEN_CHUNKS = 0.3
 
@@ -54,9 +54,7 @@ class UserProfile:
         self.last_run_time = 0
         self.run_count = 0
 
-USER_DB = {} # {user_id: UserProfile}
-# Временное хранилище сгенерированных файлов (чтобы кнопки скачивания работали)
-# Структура: {user_id: {"files": {filename: bytes}, "map": {button_id: filename}}}
+USER_DB = {}
 FILES_DB = {}
 
 def get_user(user_id):
@@ -94,7 +92,7 @@ def check_ast_security(code: str):
         raise SyntaxError(f"Синтаксическая ошибка: {e}")
 
 # =====================================================================
-# === ФЕЙКОВАЯ ФАЙЛОВАЯ СИСТЕМА (ПОДДЕРЖКА БИНАРНЫХ ФАЙЛОВ/КАРТИНОК) =
+# === ФЕЙКОВАЯ ФАЙЛОВАЯ СИСТЕМА =======================================
 # =====================================================================
 class FakeFile:
     def __init__(self, path, fs_storage, mode='r', encoding='utf-8'):
@@ -115,7 +113,6 @@ class FakeFile:
         if 'r' in self.mode and '+' not in self.mode:
             raise IOError("Файл открыт только для чтения")
         
-        # Поддерживаем запись как строк, так и байтов (для PIL и картинок)
         if isinstance(data, str):
             data = data.encode(self.encoding)
         elif not isinstance(data, bytes):
@@ -176,7 +173,7 @@ class FakeFile:
 
 class FakeFileSystem:
     def __init__(self):
-        self.files = {} # Хранит ТОЛЬКО байты! {path: bytes}
+        self.files = {}
     def open(self, path, mode='r', *args, **kwargs):
         return FakeFile(str(path), self.files, mode, kwargs.get('encoding', 'utf-8'))
 
@@ -277,7 +274,7 @@ class SafeImport:
             try:
                 return real_builtins.__import__(name, globals, locals, fromlist, level)
             except ImportError as e:
-                raise ImportError(f"Модуль '{name}' разрешен, но не установлен на сервере! ({e})")
+                raise ImportError(f"Модуль '{name}' разрешен, но не установлен! ({e})")
         
         raise ImportError(f"🚫 [SANDBOX] Импорт модуля '{name}' заблокирован!")
 
@@ -294,6 +291,13 @@ def worker_process(code: str, user_timeout: int, result_queue: Queue):
         sys.stdout = buffer
         sys.stderr = buffer
 
+        # Защита для Docker: принудительно отключаем GUI для matplotlib
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+        except ImportError:
+            pass
+
         check_ast_security(code)
 
         fs = FakeFileSystem()
@@ -301,7 +305,8 @@ def worker_process(code: str, user_timeout: int, result_queue: Queue):
         fake_sys = FakeSys()
         fake_subprocess = MagicMock(run=lambda *a, **k: MagicMock(returncode=0, stdout='[SANDBOX]', stderr=''))
 
-        safe_builtins = dict(real_builtins)
+        # ИСПРАВЛЕНО ТУТ: real_builtins.__dict__
+        safe_builtins = dict(real_builtins.__dict__)
         safe_builtins['open'] = fs.open
         safe_builtins['__import__'] = SafeImport(fake_os, fake_sys, fake_subprocess)
         safe_builtins['input'] = lambda prompt="": "[SANDBOX INPUT]"
@@ -317,7 +322,6 @@ def worker_process(code: str, user_timeout: int, result_queue: Queue):
         exec(compiled, sandbox_globals, {})
 
         exec_time = round(time.time() - start_time, 4)
-        # Возвращаем текстовый вывод и СЛОВАРЬ СОЗДАННЫХ ФАЙЛОВ (в байтах)
         result_queue.put({
             "success": True, "output": buffer.getvalue(), "error": None,
             "files": fs.files, "exec_time": exec_time
@@ -410,11 +414,10 @@ async def execute_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(user_id)
     user_code = update.message.text
     
-    # 1. АНТИ-СПАМ ЗАЩИТА
     current_time = time.time()
     if current_time - user.last_run_time < RATE_LIMIT_SECONDS:
         wait_sec = round(RATE_LIMIT_SECONDS - (current_time - user.last_run_time), 1)
-        await update.message.reply_text(f"⏳ Анти-спам. Подождите {wait_sec} сек. перед следующим запуском.")
+        await update.message.reply_text(f"⏳ Анти-спам. Подождите {wait_sec} сек.")
         return
     user.last_run_time = current_time
     user.run_count += 1
@@ -425,22 +428,17 @@ async def execute_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: await wait_msg.delete()
     except: pass
 
-    # 2. ОБРАБОТКА СГЕНЕРИРОВАННЫХ ФАЙЛОВ (Кнопки скачивания)
     reply_markup = None
     if result.get("files"):
-        # Сохраняем файлы в глобальную RAM-базу для кнопок
         FILES_DB[user_id] = {"files": result["files"], "map": {}}
         buttons = []
         for idx, filename in enumerate(result["files"].keys()):
             btn_id = f"dl_{idx}"
             FILES_DB[user_id]["map"][btn_id] = filename
-            # Обрезаем длинные имена для кнопки
             display_name = filename if len(filename) <= 30 else "..." + filename[-27:]
             buttons.append([InlineKeyboardButton(f"📂 Скачать {display_name}", callback_data=btn_id)])
-        
         reply_markup = InlineKeyboardMarkup(buttons)
 
-    # 3. ФОРМИРОВАНИЕ ТЕКСТА ОТВЕТА
     safe_code_preview = escape(user_code[:500]) + ("..." if len(user_code) > 500 else "")
     status = "✅ Успешно" if result["success"] else "❌ Ошибка/Таймаут"
     time_info = f"⏱ За {result['exec_time']}с | Лимит: {user.timeout}с"
@@ -462,7 +460,6 @@ async def execute_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(0.2)
         await send_text_chunks(user_id, context, chunks, None if result["success"] else result["error"])
         
-        # Если есть файлы, отправляем сообщение с кнопками
         if reply_markup:
             await context.bot.send_message(
                 chat_id=user_id, 
@@ -494,7 +491,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer() # Убираем часики на кнопке
+    await query.answer()
     user_id = query.from_user.id
     user = get_user(user_id)
     data = query.data
@@ -508,7 +505,7 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             ],
             [InlineKeyboardButton("🔙 Назад", callback_data="menu_back")]
         ]
-        text = "⚙️ <b>Настройки контейнера</b>\n\nУстанавливай таймаут выполнения кода (макс. 45 сек). Полезно для сложных парсеров."
+        text = "⚙️ <b>Настройки контейнера</b>\n\nУстанавливай таймаут выполнения кода (макс. 45 сек)."
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
 
     elif data.startswith("set_timeout_"):
@@ -517,7 +514,6 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         new_timeout = max(MIN_TIMEOUT, min(MAX_TIMEOUT, new_timeout))
         user.timeout = new_timeout
         
-        # Обновляем сообщение с новыми значениями
         kb = [
             [InlineKeyboardButton(f"⏱ Текущий таймаут: {user.timeout} сек", callback_data="none")],
             [
@@ -550,7 +546,7 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             "4. Файлы пишутся в ОЗУ:\n"
             "   <code>f = open('test.txt', 'w'); f.write('Hi')</code>\n"
             "5. Если скрипт создает файл (или картинку через PIL), под выводом появится кнопка для скачивания!\n"
-            "6. Не используй <code>while True</code> или бот зависнет и упадет по таймауту."
+            "6. Не используй <code>while True</code> или бот упадет по таймауту."
         )
         kb = [[InlineKeyboardButton("🔙 Назад", callback_data="menu_back")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
@@ -563,7 +559,6 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(text, reply_markup=get_main_menu(), parse_mode='HTML')
 
     elif data.startswith("dl_"):
-        # ОБРАБОТКА СКАЧИВАНИЯ ФАЙЛОВ
         if user_id not in FILES_DB:
             await query.answer("Файлы устарели. Запусти скрипт заново.", show_alert=True)
             return
@@ -578,11 +573,9 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             
         file_bytes = files_data[filename]
         
-        # Уведомляем пользователя
         await query.answer("📎 Отправляю файл...", show_alert=False)
         
         try:
-            # Определяем, картинка это или документ
             ext = filename.lower().split('.')[-1] if '.' in filename else ""
             is_image = ext in ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']
             
@@ -607,12 +600,11 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
 def main():
     app = Application.builder().token(TOKEN).build()
     
-    # Роутинг
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CallbackQueryHandler(menu_callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, execute_code))
     
-    print("🐳 Mega PySandbox Bot запущен. Нажми Ctrl+C для остановки.")
+    print("🐳 Mega PySandbox Bot запущен.")
     app.run_polling()
 
 if __name__ == "__main__":
