@@ -9,107 +9,94 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes, Com
 
 TOKEN = "8608832312:AAGKkMZTYMth41mBqiTqjhSYJypFePgtM0s"
 
-# Проверяем доступность Docker
-DOCKER_AVAILABLE = False
-try:
-    subprocess.run(["docker", "--version"], check=True, capture_output=True)
-    # Проверяем доступ к демону
-    result = subprocess.run(["docker", "info"], capture_output=True, text=True)
-    if result.returncode == 0:
-        DOCKER_AVAILABLE = True
-        print("✅ Docker доступен")
-    else:
-        print("⚠️ Docker CLI есть, но демон недоступен")
-except:
-    print("❌ Docker не установлен")
-
-def run_in_docker(code: str) -> dict:
-    """Выполняем код в Docker-контейнере"""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        f.write(code)
-        temp_file = f.name
-    
-    try:
-        # Создаём контейнер с ограничениями
-        result = subprocess.run([
-            "docker", "run", "--rm",
-            "--memory", "64m",
-            "--cpus", "0.5",
-            "--network", "none",
-            "--read-only",
-            "--tmpfs", "/tmp:noexec,nosuid,size=10m",
-            "-v", temp_file + ":/code/script.py:ro",
-            "python:3.11-alpine",
-            "python", "/code/script.py"
-        ], capture_output=True, text=True, timeout=10)
-        
-        return {
-            "success": result.returncode == 0,
-            "output": result.stdout.strip(),
-            "error": result.stderr.strip() if result.returncode != 0 else None
-        }
-        
-    except subprocess.TimeoutExpired:
-        return {"success": False, "output": "", "error": "⏱️ Таймаут (10 сек)"}
-    except Exception as e:
-        return {"success": False, "output": "", "error": str(e)}
-    finally:
-        if os.path.exists(temp_file):
-            os.unlink(temp_file)
-
-def run_chroot(code: str) -> dict:
-    """Fallback: выполняем код в chroot + ограничения ресурсов"""
+def run_isolated(code: str) -> dict:
+    """Выполняем код в изолированном chroot с ограничениями ресурсов"""
     # Создаём временную директорию для "тюрьмы"
     jail_dir = tempfile.mkdtemp()
     
     try:
-        # Копируем Python в тюрьму (минимальный набор)
-        python_path = shutil.which("python3")
-        if not python_path:
-            python_path = shutil.which("python")
+        # Создаём минимальную структуру
+        bin_dir = os.path.join(jail_dir, "bin")
+        lib_dir = os.path.join(jail_dir, "lib")
+        code_dir = os.path.join(jail_dir, "code")
+        tmp_dir = os.path.join(jail_dir, "tmp")
         
-        # Создаём структуру
-        os.makedirs(os.path.join(jail_dir, "bin"), exist_ok=True)
-        os.makedirs(os.path.join(jail_dir, "lib"), exist_ok=True)
-        os.makedirs(os.path.join(jail_dir, "code"), exist_ok=True)
+        os.makedirs(bin_dir, exist_ok=True)
+        os.makedirs(lib_dir, exist_ok=True)
+        os.makedirs(code_dir, exist_ok=True)
+        os.makedirs(tmp_dir, exist_ok=True)
         
-        # Пишем код
-        script_path = os.path.join(jail_dir, "code", "script.py")
+        # Пишем код пользователя
+        script_path = os.path.join(code_dir, "script.py")
         with open(script_path, 'w') as f:
             f.write(code)
         
-        # Запускаем с ограничениями через unshare (новые namespaces)
-        # --fork = новый процесс, --pid = новое PID пространство, --user = новый пользователь
-        # --map-root-user = мапим root внутри namespace
+        # Запускаем через unshare (новые namespaces) + chroot
+        # --fork = новый процесс
+        # --pid = новое PID пространство (изоляция процессов)
+        # --user = новый пользовательский namespace
+        # --map-root-user = мапим текущего пользователя в root внутри namespace
+        # --mount-proc = монтируем /proc
+        # --ipc = изоляция IPC
+        # --uts = изоляция hostname
+        # --net = изоляция сети (нет сети)
+        # --mount = изоляция mount points
+        
+        # Сначала копируем python3 бинарник и библиотеки в jail
+        python_path = shutil.which("python3") or shutil.which("python")
+        if python_path:
+            shutil.copy2(python_path, os.path.join(bin_dir, "python3"))
+            # Копируем зависимости (упрощённо)
+            os.system(f"ldd {python_path} 2>/dev/null | grep '=> /' | awk '{{print $3}}' | xargs -I {{}} cp -v {{}} {lib_dir}/ 2>/dev/null || true")
+        
+        # Создаём простой скрипт-обёртку который сделает chroot
+        wrapper = os.path.join(jail_dir, "run.sh")
+        with open(wrapper, 'w') as f:
+            f.write("#!/bin/bash\n")
+            f.write("chroot /jail python3 /code/script.py 2>&1\n")
+        
+        # Запускаем через bash с ограничениями
         cmd = [
-            "unshare", "--fork", "--pid", "--user", "--map-root-user",
-            "--mount-proc", "--ipc", "--uts", "--net",
-            "python3", script_path
+            "bash", "-c",
+            f"""
+            export PATH=/usr/bin:/bin
+            # Создаём namespace и chroot
+            unshare --fork --pid --user --map-root-user --mount-proc --ipc --uts --net --mount bash -c '
+                cd {jail_dir}
+                mkdir -p old_root
+                mount --bind {jail_dir} {jail_dir}
+                pivot_root . old_root
+                cd /
+                umount -l old_root 2>/dev/null
+                python3 /code/script.py
+            ' 2>&1
+            """
         ]
         
-        # Устанавливаем лимиты через ulimit в команде
-        full_cmd = [
-            "bash", "-c",
-            f"ulimit -v 65536; ulimit -t 5; ulimit -f 0; ulimit -n 10; " +
-            f"cd {jail_dir} && chroot {jail_dir} python3 /code/script.py 2>&1"
-        ]
+        # Запускаем с жёсткими лимитами ресурсов
+        def set_limits():
+            # 64 MB RAM
+            resource.setrlimit(resource.RLIMIT_AS, (64 * 1024 * 1024, 64 * 1024 * 1024))
+            # 5 секунд CPU
+            resource.setrlimit(resource.RLIMIT_CPU, (5, 5))
+            # Нельзя создавать файлы
+            resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+            # Макс 10 открытых файлов
+            resource.setrlimit(resource.RLIMIT_NOFILE, (10, 10))
+            # Макс 1 процесс
+            resource.setrlimit(resource.RLIMIT_NPROC, (1, 1))
         
         result = subprocess.run(
-            full_cmd,
+            cmd,
             capture_output=True,
             text=True,
             timeout=10,
-            preexec_fn=lambda: (
-                resource.setrlimit(resource.RLIMIT_AS, (64 * 1024 * 1024, 64 * 1024 * 1024)),
-                resource.setrlimit(resource.RLIMIT_CPU, (5, 5)),
-                resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0)),
-                resource.setrlimit(resource.RLIMIT_NOFILE, (10, 10))
-            )
+            preexec_fn=set_limits
         )
         
         return {
             "success": result.returncode == 0,
-            "output": result.stdout.strip(),
+            "output": result.stdout.strip() or "📭 (пустой вывод)",
             "error": result.stderr.strip() if result.returncode != 0 else None
         }
         
@@ -118,30 +105,26 @@ def run_chroot(code: str) -> dict:
     except Exception as e:
         return {"success": False, "output": "", "error": str(e)}
     finally:
+        # Чистим
         shutil.rmtree(jail_dir, ignore_errors=True)
 
 async def execute_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_code = update.message.text
     
-    if DOCKER_AVAILABLE:
-        result = run_in_docker(user_code)
-        method = "🐳 Docker"
-    else:
-        result = run_chroot(user_code)
-        method = "🔒 Chroot+Namespaces"
+    result = run_isolated(user_code)
     
     if result["success"]:
         text = (
             "✅ *Успешно выполнено*\n\n"
-            "🔧 Метод: " + method + "\n"
+            "🔧 Метод: 🔒 Isolated Sandbox\n"
             "💻 Код:\n```python\n" + user_code + "\n```\n"
             "📤 Вывод:\n```\n" + result['output'][:3000] + "\n```"
         )
     else:
         text = (
             "❌ *Ошибка выполнения*\n\n"
-            "🔧 Метод: " + method + "\n"
+            "🔧 Метод: 🔒 Isolated Sandbox\n"
             "💻 Код:\n```python\n" + user_code + "\n```\n"
             "🚨 Ошибка: `" + result['error'][:1000] + "`"
         )
@@ -149,11 +132,10 @@ async def execute_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=user_id, text=text, parse_mode='Markdown')
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mode = "🐳 Docker" if DOCKER_AVAILABLE else "🔒 Chroot+Namespaces"
     await update.message.reply_text(
         "🚀 *PySandbox Bot*\n\n"
         "Отправь мне любой Python-код, и я выполню его в изолированной среде!\n\n"
-        "🔧 Режим: " + mode,
+        "🔧 Режим: 🔒 Isolated Sandbox (chroot + namespaces + rlimits)",
         parse_mode='Markdown'
     )
 
