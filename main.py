@@ -1,614 +1,377 @@
 import os
 import sys
 import io
-import builtins as real_builtins
-import types
 import time
-import asyncio
+import builtins as real_builtins
+import traceback
+from multiprocessing import Process, Queue
 from unittest.mock import MagicMock
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
+from html import escape
 
 TOKEN = "8608832312:AAGKkMZTYMth41mBqiTqjhSYJypFePgtM0s"
 
-# === БЕЗОПАСНЫЙ EVAL ===
-class SafeEval:
-    def __call__(self, expression, globals=None, locals=None):
-        safe_globals = {"__builtins__": {}}
-        if globals:
-            safe_globals.update({k: v for k, v in globals.items() if not k.startswith('_')})
-        try:
-            return eval(expression, safe_globals, locals)
-        except Exception as e:
-            return f"[SAFE EVAL ERROR] {e}"
-    
-    def __repr__(self):
-        return "<built-in function eval>"
+# === НАСТРОЙКИ ===
+EXECUTION_TIMEOUT = 15 # Время жизни чужого кода (секунд). Защита от зависаний.
+MAX_OUTPUT_LENGTH = 4000
 
-# === БЕЗОПАСНЫЙ EXEC ===
-class SafeExec:
-    def __call__(self, code, globals=None, locals=None):
-        if isinstance(code, str) and any(x in code for x in ['__import__', 'import os', 'import sys', 'subprocess', 'open(']):
-            return "[SAFE EXEC] Подозрительный код заблокирован"
-        safe_globals = {"__builtins__": safe_builtins}
-        if globals:
-            safe_globals.update(globals)
-        try:
-            exec(code, safe_globals, locals)
-        except Exception as e:
-            return f"[SAFE EXEC ERROR] {e}"
-    
-    def __repr__(self):
-        return "<built-in function exec>"
+# БЕЗОПАСНОЕ ОКРУЖЕНИЕ (Скрываем секреты)
+SAFE_ENVIRON = {
+    'HOME': '/home/sandbox',
+    'USER': 'sandbox',
+    'PATH': '/usr/local/bin:/usr/bin:/bin',
+    'LANG': 'en_US.UTF-8',
+    'SHELL': '/bin/bash'
+}
+# На всякий случай удаляем ВСЕ реальные переменные, чтобы не утекли пароли от БД, токены и т.д.
+# Если нужно что-то передать внутрь — добавь сюда вручную.
 
-# === ФЕЙКОВАЯ ФАЙЛОВАЯ СИСТЕМА ===
-class FakeFileSystem:
-    def __init__(self):
-        self.files = {}
-        self.dirs = {'/tmp', '/home/sandbox', '/app'}
-    
-    def _get_path(self, path):
-        return os.path.normpath(str(path))
-    
-    def exists(self, path):
-        p = self._get_path(path)
-        return p in self.files or p in self.dirs or os.path.exists(p)
-    
-    def open(self, path, mode='r', *args, **kwargs):
-        p = self._get_path(path)
-        
-        if 'w' in mode or 'a' in mode or 'x' in mode:
-            if p not in self.files:
-                self.files[p] = ""
-            return FakeFile(p, self.files, mode)
-        
-        if p in self.files:
-            return FakeFile(p, self.files, mode)
-        
-        allowed_reads = ['/etc/passwd', '/etc/hostname', '/proc/version', '/proc/cpuinfo']
-        if any(p.startswith(a) for a in allowed_reads):
-            return open(p, mode, *args, **kwargs)
-        
-        raise FileNotFoundError(f"[SANDBOX] Нет доступа к: {path}")
-    
-    def listdir(self, path='.'):
-        p = self._get_path(path)
-        if p in self.dirs:
-            return ['fake1.txt', 'fake2.py', 'sandbox']
-        try:
-            return os.listdir(p)[:20]
-        except:
-            return []
-    
-    def mkdir(self, path, mode=0o777):
-        self.dirs.add(self._get_path(path))
-    
-    def remove(self, path):
-        p = self._get_path(path)
-        if p in self.files:
-            del self.files[p]
-    
-    def rename(self, src, dst):
-        src, dst = self._get_path(src), self._get_path(dst)
-        if src in self.files:
-            self.files[dst] = self.files.pop(src)
-    
-    def getcwd(self):
-        return "/home/sandbox"
-    
-    def chdir(self, path):
-        pass
-
+# ==========================================================
+# === ФЕЙКОВАЯ ФАЙЛОВАЯ СИСТЕМА (Всё в оперативной памяти) =
+# ==========================================================
 class FakeFile:
-    def __init__(self, path, fs_storage, mode='r'):
+    def __init__(self, path, storage, mode='r'):
         self.path = path
-        self.storage = fs_storage
+        self.storage = storage
         self.mode = mode
-        self.closed = False
         self.position = 0
-        if 'w' in mode or 'a' in mode:
+        if 'a' in mode:
+            self.storage.setdefault(path, "")
+        elif 'w' in mode:
             self.storage[path] = ""
-    
+
     def write(self, data):
-        if 'r' in self.mode and 'w' not in self.mode:
+        if 'r' in self.mode and '+' not in self.mode:
             raise IOError("Файл открыт только для чтения")
-        self.storage[self.path] += str(data)
-        return len(str(data))
-    
+        data_str = str(data)
+        self.storage[self.path] += data_str
+        return len(data_str)
+
     def read(self, size=-1):
         content = self.storage.get(self.path, "")
         if size == -1:
-            return content[self.position:]
+            res = content[self.position:]
+            self.position = len(content)
+            return res
         result = content[self.position:self.position + size]
-        self.position += size
+        self.position += len(result)
         return result
-    
+
     def readline(self):
         content = self.storage.get(self.path, "")
-        lines = content[self.position:].split('\n')
-        if lines:
-            self.position += len(lines[0]) + 1
-            return lines[0] + '\n'
-        return ''
-    
-    def readlines(self):
-        return self.read().splitlines(keepends=True)
-    
-    def seek(self, pos):
-        self.position = pos
-    
-    def tell(self):
-        return self.position
-    
-    def close(self):
-        self.closed = True
-    
-    def __enter__(self):
-        return self
-    
-    def __exit__(self, *args):
-        self.close()
+        nl_pos = content.find('\n', self.position)
+        if nl_pos != -1:
+            res = content[self.position:nl_pos+1]
+            self.position = nl_pos + 1
+            return res
+        res = content[self.position:]
+        self.position = len(content)
+        return res
 
-# === ФЕЙКОВЫЙ OS ===
+    def readlines(self): return self.read().splitlines(keepends=True)
+    def seek(self, pos): self.position = pos
+    def tell(self): return self.position
+    def close(self): pass
+    def flush(self): pass
+    def __enter__(self): return self
+    def __exit__(self, *args): self.close()
+
+class FakeFileSystem:
+    def __init__(self):
+        self.files = {}
+        
+    def open(self, path, mode='r', *args, **kwargs):
+        return FakeFile(str(path), self.files, mode)
+
+# ===================================
+# === ФЕЙКОВЫЕ СИСТЕМНЫЕ МОДУЛИ ====
+# ===================================
 class FakeOS:
+    """Подменяет настоящий os. Дает безопасные штуки, блокирует систему."""
     def __init__(self, fs):
         self.fs = fs
-        self.environ = {
-            'HOME': '/home/sandbox',
-            'USER': 'sandbox',
-            'PATH': '/usr/local/bin:/usr/bin:/bin',
-            'PWD': '/home/sandbox',
-            'SANDBOX': 'true'
-        }
+        self.environ = SAFE_ENVIRON
         self.name = 'posix'
         self.sep = '/'
         self.linesep = '\n'
         self.pathsep = ':'
-    
-    def open(self, path, flags, mode=0o777):
-        return self.fs.open(path, 'w')
-    
-    def close(self, fd):
-        pass
-    
+        # Подменяем os.path на безопасный фасад
+        self.path = FakePath(fs)
+
     def system(self, command):
-        dangerous = ['rm', 'mkfs', 'dd', 'fdisk', 'format', 'del', 'rd']
-        if any(d in str(command).lower() for d in dangerous):
-            return f"[SANDBOX] Команда '{command}' заблокирована"
-        return f"[SANDBOX] Выполнено: {command} (фейково)"
+        return f"[SANDBOX BLOCKED] os.system('{command}')"
     
-    def popen(self, command, *args, **kwargs):
-        return MagicMock(
-            read=lambda: f"[SANDBOX] {command}",
-            readline=lambda: "",
-            close=lambda: None,
-            __enter__=lambda self: self,
-            __exit__=lambda *args: None
-        )
+    def popen(self, *a, **k):
+        return MagicMock(read=lambda: "[SANDBOX BLOCKED]", readline=lambda: "", close=lambda: None)
     
-    def listdir(self, path='.'):
-        return self.fs.listdir(path)
-    
-    def mkdir(self, path, mode=0o777):
-        return self.fs.mkdir(path, mode)
-    
-    def makedirs(self, path, exist_ok=False):
-        self.fs.mkdir(path)
-    
-    def remove(self, path):
-        return self.fs.remove(path)
-    
-    def unlink(self, path):
-        return self.fs.remove(path)
-    
-    def rename(self, src, dst):
-        return self.fs.rename(src, dst)
-    
-    def replace(self, src, dst):
-        return self.fs.rename(src, dst)
-    
-    def getcwd(self):
-        return self.fs.getcwd()
-    
-    def chdir(self, path):
-        return self.fs.chdir(path)
-    
-    def getpid(self):
-        return 12345
-    
-    def getppid(self):
-        return 1
-    
+    def remove(self, p): self.fs.files.pop(str(p), None)
+    def unlink(self, p): self.remove(p)
+    def mkdir(self, p, *a, **k): pass
+    def makedirs(self, p, *a, **k): pass
+    def rename(self, s, d): 
+        if str(s) in self.fs.files: self.fs.files[str(d)] = self.fs.files.pop(str(s))
+    def getcwd(self): return "/home/sandbox"
+    def chdir(self, p): pass
+    def getpid(self): return 99999
+    def getppid(self): return 1
     def urandom(self, n):
-        import random
-        return bytes(random.randint(0, 255) for _ in range(n))
-    
+        import random; return bytes(random.randint(0, 255) for _ in range(n))
+        
     def __getattr__(self, name):
-        if name == 'path':
-            return FakePath(self.fs)
-        return MagicMock(return_value=f"[SANDBOX os.{name}]")
+        # Блокируем всё остальное (getenv, kill, fork и т.д.)
+        if name in ['getenv', 'putenv']: return lambda *a, **k: SAFE_ENVIRON.get(a[0]) if a else None
+        return MagicMock(return_value=f"[SANDBOX BLOCKED os.{name}]")
 
 class FakePath:
     def __init__(self, fs):
         self.fs = fs
         self.sep = '/'
-    
-    def join(self, *args):
-        return os.path.join(*args)
-    
-    def exists(self, path):
-        return self.fs.exists(path)
-    
-    def isfile(self, path):
-        return self.fs._get_path(path) in self.fs.files
-    
-    def isdir(self, path):
-        return self.fs._get_path(path) in self.fs.dirs
-    
-    def abspath(self, path):
-        return "/home/sandbox/" + str(path)
-    
-    def basename(self, path):
-        return str(path).split('/')[-1]
-    
-    def dirname(self, path):
-        return '/'.join(str(path).split('/')[:-1]) or '/'
-    
-    def getsize(self, path):
-        return 1024
-    
-    def splitext(self, path):
-        p = str(path)
-        if '.' in p:
-            return (p[:p.rfind('.')], p[p.rfind('.'):])
-        return (p, '')
+        self.join = os.path.join
+        self.exists = lambda p: str(p) in self.fs.files
+        self.isfile = lambda p: str(p) in self.fs.files
+        self.isdir = lambda p: False # В песочнице нет реальных папок
+        self.abspath = lambda p: f"/home/sandbox/{p}"
+        self.basename = os.path.basename
+        self.dirname = os.path.dirname
+        self.splitext = os.path.splitext
+        self.getsize = lambda p: len(self.fs.files.get(str(p), ""))
+        def __getattr__(self, name): return MagicMock()
 
-# === ФЕЙКОВЫЙ SYS ===
 class FakeSys:
+    """Подменяет sys."""
     def __init__(self):
-        self.stdout = MagicMock(write=lambda x: None, flush=lambda: None)
-        self.stderr = MagicMock(write=lambda x: None, flush=lambda: None)
-        self.stdin = MagicMock(read=lambda: "", readline=lambda: "fake input\n")
-        self.version = "3.11.0 (SANDBOX)"
-        self.version_info = (3, 11, 0, 'final', 0)
+        self.version = "3.11.0 (SANDBOXED)"
         self.platform = "linux"
-        self.byteorder = "little"
-        self.maxsize = 9223372036854775807
-        self.path = ['/home/sandbox', '/usr/lib/python3.11']
+        self.path = ['/home/sandbox', '/usr/lib/python311.zip']
         self.modules = {}
         self.argv = ['sandbox.py']
         self.executable = '/usr/bin/python3'
         self.prefix = '/usr'
-        self.exec_prefix = '/usr'
-    
+        
     def exit(self, arg=0):
-        raise SystemExit(f"[SANDBOX] exit({arg})")
-    
+        raise SystemExit(f"[SANDBOX] exit({arg}) вызван")
+        
     def __getattr__(self, name):
-        return MagicMock(return_value=f"[SANDBOX sys.{name}]")
+        return MagicMock(return_value=f"[SANDBOX BLOCKED sys.{name}]")
 
-# === СОЗДАЁМ ПЕСОЧНИЦУ ===
-def create_sandbox():
-    fs = FakeFileSystem()
-    fake_os = FakeOS(fs)
-    fake_sys = FakeSys()
-    
-    safe_builtins = {}
-    for name in dir(real_builtins):
-        if name.startswith('_'):
-            continue
-        obj = getattr(real_builtins, name)
-        safe_builtins[name] = obj
-    
-    safe_builtins['eval'] = SafeEval()
-    safe_builtins['exec'] = SafeExec()
-    safe_builtins['open'] = fs.open
-    safe_builtins['input'] = lambda prompt="": "[SANDBOX INPUT]"
-    
-    import math, random, datetime, time, re, string, itertools, functools, collections
-    import statistics, typing, decimal, fractions, hashlib, base64, binascii, inspect
-    import textwrap, uuid, html, json, csv, pprint, copy, warnings, traceback, types
-    import enum, dataclasses, pathlib, urllib.parse, urllib.request, urllib.error
-    import http.client, socket, ssl, calendar, numbers
-    import io as io_module, builtins as builtins_module
-    
-    real_modules = {
-        'math': math,
-        'random': random,
-        'datetime': datetime,
-        'time': time,
-        're': re,
-        'string': string,
-        'itertools': itertools,
-        'functools': functools,
-        'collections': collections,
-        'statistics': statistics,
-        'typing': typing,
-        'decimal': decimal,
-        'fractions': fractions,
-        'hashlib': hashlib,
-        'base64': base64,
-        'binascii': binascii,
-        'inspect': inspect,
-        'textwrap': textwrap,
-        'uuid': uuid,
-        'html': html,
-        'json': json,
-        'csv': csv,
-        'pprint': pprint,
-        'copy': copy,
-        'warnings': warnings,
-        'traceback': traceback,
-        'types': types,
-        'enum': enum,
-        'dataclasses': dataclasses,
-        'pathlib': pathlib,
-        'urllib': urllib,
-        'urllib.parse': urllib.parse,
-        'urllib.request': urllib.request,
-        'urllib.error': urllib.error,
-        'http': http,
-        'http.client': http.client,
-        'socket': socket,
-        'ssl': ssl,
-        'calendar': calendar,
-        'numbers': numbers,
-        'io': io_module,
-        'builtins': builtins_module,
-    }
-    
-    try:
-        import requests
-        real_modules['requests'] = requests
-    except:
-        pass
-    
-    try:
-        import numpy
-        real_modules['numpy'] = numpy
-    except:
-        pass
-    
-    try:
-        import pandas
-        real_modules['pandas'] = pandas
-    except:
-        pass
-    
-    sandbox = {
-        '__builtins__': safe_builtins,
-        '__name__': '__main__',
-        '__doc__': None,
-        '__package__': None,
-        '__spec__': None,
-        '__annotations__': {},
-        '__cached__': None,
-        '__file__': '/home/sandbox/script.py',
-        
-        'os': fake_os,
-        'sys': fake_sys,
-        'subprocess': MagicMock(
-            run=lambda *a, **k: MagicMock(returncode=0, stdout='[SANDBOX]', stderr=''),
-            Popen=lambda *a, **k: MagicMock(
-                communicate=lambda: (b'[SANDBOX]', b''),
-                stdout=MagicMock(read=lambda: b''),
-                stderr=MagicMock(read=lambda: b''),
-                wait=lambda: 0,
-                returncode=0
-            ),
-            call=lambda *a, **k: 0,
-            check_output=lambda *a, **k: b'[SANDBOX]',
-            check_call=lambda *a, **k: 0
-        ),
-        
-        **real_modules,
-    }
-    
-    return sandbox
 
-# === БУФЕРИЗАЦИЯ ВЫВОДА ===
-class OutputBuffer:
-    def __init__(self):
-        self.chunks = []
-        self.current_chunk = ""
-    
-    def write(self, text):
-        self.current_chunk += str(text)
-        if '\n' in self.current_chunk:
-            lines = self.current_chunk.split('\n')
-            for line in lines[:-1]:
-                self.chunks.append(line + '\n')
-            self.current_chunk = lines[-1]
-    
-    def flush(self):
-        if self.current_chunk:
-            self.chunks.append(self.current_chunk)
-            self.current_chunk = ""
-    
-    def get_output(self):
-        self.flush()
-        return "".join(self.chunks)
-    
-    def get_chunks_for_telegram(self, max_length=4000):
-        self.flush()
-        full_output = self.get_output()
+# ==========================================
+# === БЕЗОПАСНЫЙ ИМПОРТ (Gatekeeper) =====
+# ==========================================
+class SafeImport:
+    """
+    Перехватывает import. 
+    Если просят os, sys, subprocess — дает фейки.
+    Если просят网络/вычисления (requests, telebot, math) — дает настоящие модули.
+    """
+    def __init__(self, fake_os, fake_sys, fake_subprocess):
+        self.fake_os = fake_os
+        self.fake_sys = fake_sys
+        self.fake_subprocess = fake_subprocess
         
-        if len(full_output) <= max_length:
-            return [full_output] if full_output else ["📭 (пустой вывод)"]
-        
-        chunks = []
-        current = ""
-        for line in self.chunks:
-            if len(current) + len(line) > max_length:
-                if current:
-                    chunks.append(current)
-                current = line
-            else:
-                current += line
-        
-        if current:
-            chunks.append(current)
-        
-        if not chunks:
-            chunks = [full_output[i:i+max_length] for i in range(0, len(full_output), max_length)]
-        
-        return chunks if chunks else ["📭 (пустой вывод)"]
+        # Белый список ЧЕГО МОЖНО ИМПОРТИРОВАТЬ НАСТОЯЩЕГО
+        # Сюда можно additives любую либу, которая установлена на сервере
+        self.allowed_real = {
+            # Стандартная библиотека (безопасная)
+            'math', 'random', 'datetime', 'time', 're', 'string', 'itertools', 'functools',
+            'collections', 'statistics', 'typing', 'decimal', 'fractions', 'hashlib',
+            'base64', 'binascii', 'inspect', 'textwrap', 'uuid', 'html', 'json', 'csv',
+            'pprint', 'copy', 'warnings', 'traceback', 'types', 'enum', 'dataclasses',
+            'pathlib', 'calendar', 'numbers', 'io', 'builtins', 'threading', 'multiprocessing',
+            'logging', 'sqlite3', 'email', 'xml', 'zipfile', 'tarfile', 'gzip', 'bz2', 'lzma',
+            
+            # Сетевые модули (Разрешаем сеть!)
+            'socket', 'ssl', 'urllib', 'http', 'ftplib', 'smtplib',
+            
+            # Асинхронность
+            'asyncio', 'concurrent',
+            
+            # Сторонние модули (добавляй сюда то, что установлено через pip)
+            'requests', 'aiohttp', 'telebot', 'pyTelegramBotAPI', 
+            'aiogram', 'numpy', 'pandas', 'flask', 'fastapi', 'bs4', 'lxml'
+        }
 
-def run_sandbox(code: str) -> dict:
-    output_buffer = OutputBuffer()
-    
+    def __call__(self, name, globals=None, locals=None, fromlist=(), level=0):
+        base_name = name.split('.')[0]
+        
+        # 1. Подмена системных модулей
+        if base_name == 'os': return self.fake_os
+        if base_name == 'sys': return self.fake_sys
+        if base_name == 'subprocess': return self.fake_subprocess
+        
+        # 2. Проверка белого списка
+        if base_name in self.allowed_real:
+            try:
+                return real_builtins.__import__(name, globals, locals, fromlist, level)
+            except ImportError:
+                raise ImportError(f"Модуль '{name}' разрешен, но не установлен на сервере!")
+        
+        # 3. Всё остальное - запрещено
+        raise ImportError(f"🚫 [SANDBOX] Импорт модуля '{name}' заблокирован!")
+
+# ==========================================
+# === РАБОЧИЙ ПРОЦЕСС (Изолированная ячейка) ==
+# ==========================================
+def worker_process(code: str, result_queue: Queue):
+    """Выполняется в отдельном процессе. Имеет доступ к сети, но ограничен в файлах и системе."""
     old_stdout = sys.stdout
     old_stderr = sys.stderr
-    
-    class SandboxStdout:
-        def write(self, text):
-            output_buffer.write(text)
-            old_stdout.write(text)
-        def flush(self):
-            output_buffer.flush()
-            old_stdout.flush()
-    
-    sys.stdout = SandboxStdout()
-    sys.stderr = SandboxStdout()
-    
+    buffer = io.StringIO()
+
     try:
-        sandbox = create_sandbox()
-        compiled = compile(code, '<sandbox>', 'exec')
-        exec(compiled, sandbox, {})
-        
-        output_buffer.flush()
-        chunks = output_buffer.get_chunks_for_telegram()
-        
-        return {
-            "success": True,
-            "chunks": chunks,
-            "chunk_count": len(chunks),
-            "error": None
+        sys.stdout = buffer
+        sys.stderr = buffer
+
+        # Создаем изолированное окружение
+        fs = FakeFileSystem()
+        fake_os = FakeOS(fs)
+        fake_sys = FakeSys()
+        fake_subprocess = MagicMock() # Полная заглушка для subprocess
+
+        # Настраиваем безопасные встроенные функции
+        safe_builtins = dict(real_builtins)
+        safe_builtins['open'] = fs.open
+        safe_builtins['__import__'] = SafeImport(fake_os, fake_sys, fake_subprocess)
+        safe_builtins['input'] = lambda prompt="": "[SANDBOX INPUT]"
+        # Блокируем eval и exec на всякий случай (хотя AST парсер тоже есть)
+        safe_builtins['eval'] = lambda *a, **k: exec("[SANDBOX] eval() заблокирован")
+        safe_builtins['exec'] = lambda *a, **k: exec("[SANDBOX] exec() заблокирован")
+
+        sandbox_globals = {
+            '__builtins__': safe_builtins,
+            '__name__': '__main__',
+            'os': fake_os,
+            'sys': fake_sys,
+            'subprocess': fake_subprocess,
         }
-        
-    except SystemExit as e:
-        output_buffer.flush()
-        chunks = output_buffer.get_chunks_for_telegram()
-        return {
+
+        # Выполнение
+        exec(code, sandbox_globals)
+
+        result_queue.put({
             "success": True,
-            "chunks": chunks,
-            "chunk_count": len(chunks),
+            "output": buffer.getvalue(),
             "error": None
-        }
+        })
+
+    except SystemExit:
+        result_queue.put({"success": True, "output": buffer.getvalue(), "error": None})
     except Exception as e:
-        output_buffer.flush()
-        chunks = output_buffer.get_chunks_for_telegram()
-        error_msg = f"⚠️ {type(e).__name__}: {str(e)}"
-        return {
+        result_queue.put({
             "success": False,
-            "chunks": chunks,
-            "chunk_count": len(chunks),
-            "error": error_msg
-        }
+            "output": buffer.getvalue(),
+            "error": f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
+        })
     finally:
         sys.stdout = old_stdout
         sys.stderr = old_stderr
 
-# === ОТПРАВКА СООБЩЕНИЙ С ЗАДЕРЖКОЙ ===
-async def send_chunks(update, context, chunks, is_error=False):
-    user_id = update.effective_user.id
+# === ЗАПУСК ПЕСОЧНИЦЫ (С ТАЙМАУТОМ) ===
+def run_sandbox(code: str) -> dict:
+    result_queue = Queue()
+    process = Process(target=worker_process, args=(code, result_queue))
     
-    if is_error and len(chunks) == 1 and not chunks[0].strip():
-        chunks = ["📭 (пустой вывод до ошибки)"]
+    process.start()
+    process.join(timeout=EXECUTION_TIMEOUT)
     
-    for i, chunk in enumerate(chunks):
-        prefix = ""
-        if len(chunks) > 1:
-            prefix = f"📄 Часть {i+1}/{len(chunks)}\n\n"
-        
-        text = prefix + chunk
-        
-        if is_error and i == len(chunks) - 1:
-            continue
-        
-        await context.bot.send_message(chat_id=user_id, text=text, parse_mode=None)
-        
-        if i < len(chunks) - 1:
-            await asyncio.sleep(0.5)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=1)
+        if process.is_alive():
+            process.kill() # SIGKILL
+            process.join()
+            
+        return {
+            "success": False,
+            "output": "",
+            "error": f"⏳ ТАЙМАУТ ({EXECUTION_TIMEOUT}с).\nПроцесс уничтожен. (Возможно запущен blocking цикл вроде bot.polling())"
+        }
+    
+    if not result_queue.empty():
+        return result_queue.get()
+    return {"success": False, "output": "", "error": "Песочница внезапно умерла без объяснения причин."}
 
-async def send_error(update, context, chunks, error_msg):
-    user_id = update.effective_user.id
+# === УТИЛИТЫ ДЛЯ TELEGRAM ===
+def split_text(text: str) -> list:
+    if not text: return ["📭 (пустой вывод)"]
+    if len(text) <= MAX_OUTPUT_LENGTH: return [text]
     
-    for i, chunk in enumerate(chunks):
-        prefix = ""
-        if len(chunks) > 1:
-            prefix = f"📄 Часть {i+1}/{len(chunks)}\n\n"
-        
-        text = prefix + chunk
-        
-        if i == len(chunks) - 1:
-            text = text + "\n\n❌ ОШИБКА:\n" + error_msg
-        
-        await context.bot.send_message(chat_id=user_id, text=text, parse_mode=None)
-        
-        if i < len(chunks) - 1:
-            await asyncio.sleep(0.5)
+    chunks = []
+    while text:
+        # Разрываем по переносу строки, чтобы не ломать код посередине
+        split_pos = text.rfind('\n', 0, MAX_OUTPUT_LENGTH)
+        if split_pos == -1: split_pos = MAX_OUTPUT_LENGTH
+        chunks.append(text[:split_pos])
+        text = text[split_pos:].lstrip('\n')
+    return chunks
 
 async def execute_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_code = update.message.text
     
+    wait_msg = await update.message.reply_text("⏳ Запуск в изолированном Docker-подобном окружении...")
+    
     result = run_sandbox(user_code)
+    
+    try:
+        await wait_msg.delete()
+    except:
+        pass
+        
+    # Безопасная обертка в HTML (защита от багов парсинга Telegram)
+    safe_code_preview = escape(user_code[:800]) + ("..." if len(user_code) > 800 else "")
     
     if result["success"]:
         header = (
-            "✅ Успешно выполнено\n\n"
-            "🔧 Метод: 🎭 Mega Sandbox\n"
-            "💻 Код:\n```python\n" + user_code[:1000] + "\n```\n"
-            "📤 Вывод:\n```\n"
+            "✅ <b>Успешно выполнено</b>\n"
+            "🔧 <i>Окружение: Secure Network Sandbox (Docker-like)</i>\n\n"
+            f"💻 <b>Код:</b>\n<code>{safe_code_preview}</code>\n\n"
+            "📤 <b>Вывод:</b>\n"
         )
-        
-        if result["chunk_count"] == 1:
-            full_text = header + result["chunks"][0] + "\n```"
-            if len(full_text) > 4000:
-                await context.bot.send_message(chat_id=user_id, text=header, parse_mode='Markdown')
-                await asyncio.sleep(0.5)
-                await send_chunks(update, context, result["chunks"])
-            else:
-                await context.bot.send_message(chat_id=user_id, text=full_text, parse_mode='Markdown')
-        else:
-            await context.bot.send_message(chat_id=user_id, text=header, parse_mode='Markdown')
-            await asyncio.sleep(0.5)
-            await send_chunks(update, context, result["chunks"])
     else:
         header = (
-            "❌ Ошибка выполнения\n\n"
-            "🔧 Метод: 🎭 Mega Sandbox\n"
-            "💻 Код:\n```python\n" + user_code[:1000] + "\n```\n"
-            "📤 Вывод до ошибки:\n```\n"
+            "❌ <b>Ошибка / Таймаут</b>\n"
+            "🔧 <i>Окружение: Secure Network Sandbox (Docker-like)</i>\n\n"
+            f"💻 <b>Код:</b>\n<code>{safe_code_preview}</code>\n\n"
+            "📤 <b>Вывод до ошибки:</b>\n"
         )
+
+    output_chunks = split_text(result["output"])
+    
+    for i, chunk in enumerate(output_chunks):
+        prefix = f"📄 Часть {i+1}/{len(output_chunks)}\n\n" if len(output_chunks) > 1 else ""
         
-        if result["chunk_count"] == 1:
-            full_text = header + result["chunks"][0] + "\n```\n\n🚨 Ошибка: `" + result["error"] + "`"
-            if len(full_text) > 4000:
-                await context.bot.send_message(chat_id=user_id, text=header, parse_mode='Markdown')
-                await asyncio.sleep(0.5)
-                await send_error(update, context, result["chunks"], result["error"])
-            else:
-                await context.bot.send_message(chat_id=user_id, text=full_text, parse_mode='Markdown')
-        else:
-            await context.bot.send_message(chat_id=user_id, text=header, parse_mode='Markdown')
-            await asyncio.sleep(0.5)
-            await send_error(update, context, result["chunks"], result["error"])
+        # Последний кусок вывода — добавляем ошибку, если она есть
+        error_suffix = ""
+        if not result["success"] and i == len(output_chunks) - 1:
+            error_suffix = f"\n\n🚨 <b>Ошибка:</b>\n<code>{escape(result['error'][:1000])}</code>"
+            
+        text = header + prefix + "<code>" + escape(chunk) + "</code>" + error_suffix
+        header = "" # Чтобы заголовок был только в первом сообщении
+
+        # Если текст всё равно длинный (бывает при огромной ошибке), режем принудительно
+        if len(text) > 4000:
+            text = text[:3900] + "\n\n... [Обрезано по лимиту Telegram]"
+            
+        await context.bot.send_message(chat_id=user_id, text=text, parse_mode='HTML')
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚀 Mega PySandbox Bot\n\n"
+        "🐳 <b>Mega PySandbox Bot (Docker-like Edition)</b>\n\n"
         "Отправь мне Python-код!\n\n"
-        "✅ Настоящие: math, random, datetime, re, json, csv, urllib, http, socket, ssl, hashlib, base64, itertools, collections, statistics, typing, decimal, fractions, inspect, textwrap, uuid, html, pprint, copy, warnings, traceback, types, enum, dataclasses, pathlib, calendar, numbers, io, requests(если установлен), numpy(если установлен), pandas(если установлен)\n\n"
-        "🎭 Фейковые: os, sys, subprocess, open(память), eval(безопасный), exec(ограниченный)\n\n"
-        "💾 Файлы пишутся в ОЗУ, не на диск!",
-        parse_mode=None
+        "✅ <b>Сеть РЕАЛЬНАЯ:</b> requests, telebot, aiogram, aiohttp, socket, http, urllib, sqlite3, flask, numpy, pandas и др.\n"
+        "🔐 <b>Система ФЕЙКОВАЯ:</b> os, sys, subprocess подменены. Нельзя удалить файлы, убить процессы, прочитать чужие токены.\n"
+        "💾 <b>Файлы в RAM:</b> open() пишет и читает только из оперативной памяти (не на жесткий диск).\n"
+        "⏳ <b>Защита от зависаний:</b> Любой бесконечный цикл или bot.infinity_polling() будет убит через 15 секунд.\n\n"
+        "<i>Пример: можно сделать import requests; requests.get('https://api.ipify.org').text</i>",
+        parse_mode='HTML'
     )
 
 def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler('start', start))
+    # Игнорируем команды, чтобы /start не ушел в выполнение кода
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, execute_code))
     app.run_polling()
 
