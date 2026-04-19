@@ -1,33 +1,57 @@
 import os
-import sys
-import asyncio
+import subprocess
+import time
 import tempfile
-import io
-from contextlib import redirect_stdout
+import docker
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
 
 TOKEN = "8608832312:AAGKkMZTYMth41mBqiTqjhSYJypFePgtM0s"
 
-DOCKER_AVAILABLE = os.path.exists('/var/run/docker.sock')
-
-if DOCKER_AVAILABLE:
-    import docker
-    client = docker.from_env()
-
-if not DOCKER_AVAILABLE:
-    from RestrictedPython import compile_restricted
-    from RestrictedPython.Guards import safe_builtins, full_write_guard
-
-def safe_print(*args, **kwargs):
-    print(*args, **kwargs)
+def start_docker_daemon():
+    """Запускаем Docker-демон внутри контейнера"""
+    try:
+        # Проверяем если уже запущен
+        subprocess.run(["docker", "info"], check=True, capture_output=True)
+        print("✅ Docker уже запущен")
+        return True
+    except:
+        print("🚀 Запускаем Docker-демон...")
+        
+    # Запускаем dockerd в фоне
+    subprocess.Popen(
+        ["dockerd", "--host=unix:///var/run/docker.sock", "--storage-driver=vfs"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    
+    # Ждём пока запустится
+    for i in range(30):
+        time.sleep(1)
+        try:
+            subprocess.run(["docker", "info"], check=True, capture_output=True)
+            print("✅ Docker-демон запущен")
+            return True
+        except:
+            continue
+    
+    print("❌ Не удалось запустить Docker")
+    return False
 
 def run_in_docker(code: str) -> dict:
+    client = docker.from_env()
+    
     with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
         f.write(code)
         temp_file = f.name
     
     try:
+        # Предварительно скачиваем образ если нет
+        try:
+            client.images.get("python:3.11-alpine")
+        except:
+            client.images.pull("python:3.11-alpine")
+        
         container = client.containers.run(
             image="python:3.11-alpine",
             command="python /code/script.py",
@@ -55,67 +79,23 @@ def run_in_docker(code: str) -> dict:
         if os.path.exists(temp_file):
             os.unlink(temp_file)
 
-def run_restricted(code: str) -> dict:
-    try:
-        restricted_globals = {
-            "__builtins__": {
-                "True": True, "False": False, "None": None,
-                "str": str, "int": int, "float": float, "bool": bool,
-                "len": len, "range": range, "enumerate": enumerate, "zip": zip,
-                "list": list, "dict": dict, "tuple": tuple, "set": set,
-                "sum": sum, "min": min, "max": max, "abs": abs, "round": round,
-                "type": type, "isinstance": isinstance, "hasattr": hasattr,
-                "print": safe_print,
-            },
-            "_getattr_": getattr,
-            "_setattr_": setattr,
-            "_delattr_": delattr,
-            "_getitem_": lambda x, y: x[y],
-            "_setitem_": lambda x, y, z: x.__setitem__(y, z),
-            "_iter_unpack_sequence_": lambda x, y: x,
-            "_unpack_sequence_": lambda x, y: x,
-            "_print_": safe_print,
-        }
-        
-        bytecode = compile_restricted(code, '<inline>', 'exec')
-        if bytecode is None:
-            return {"success": False, "output": "", "error": "🚫 Ошибка компиляции"}
-        
-        output_buffer = io.StringIO()
-        with redirect_stdout(output_buffer):
-            exec(bytecode, restricted_globals, {})
-        
-        return {
-            "success": True,
-            "output": output_buffer.getvalue().strip() or "📭 (пустой вывод)",
-            "error": None
-        }
-        
-    except Exception as e:
-        return {"success": False, "output": "", "error": "⚠️ " + str(e)}
-
 async def execute_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_code = update.message.text
     
-    method = "🐳 Docker" if DOCKER_AVAILABLE else "🔒 RestrictedPython"
-    
-    if DOCKER_AVAILABLE:
-        result = run_in_docker(user_code)
-    else:
-        result = run_restricted(user_code)
+    result = run_in_docker(user_code)
     
     if result["success"]:
         text = (
             "✅ *Успешно выполнено*\n\n"
-            "🔧 Метод: " + method + "\n"
+            "🐳 Метод: Docker\n"
             "💻 Код:\n```python\n" + user_code + "\n```\n"
             "📤 Вывод:\n```\n" + result['output'][:3000] + "\n```"
         )
     else:
         text = (
             "❌ *Ошибка выполнения*\n\n"
-            "🔧 Метод: " + method + "\n"
+            "🐳 Метод: Docker\n"
             "💻 Код:\n```python\n" + user_code + "\n```\n"
             "🚨 Ошибка: `" + result['error'] + "`"
         )
@@ -125,12 +105,17 @@ async def execute_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🚀 *PySandbox Bot*\n\n"
-        "Отправь мне любой Python-код, и я выполню его в изолированной среде!\n\n"
-        + ('🐳 Режим: Docker' if DOCKER_AVAILABLE else '🔒 Режим: RestrictedPython'),
+        "Отправь мне любой Python-код, и я выполню его в изолированном Docker-контейнере!\n\n"
+        "🐳 Режим: Docker-in-Docker",
         parse_mode='Markdown'
     )
 
 def main():
+    # Запускаем Docker-демон перед стартом бота
+    if not start_docker_daemon():
+        print("❌ Критическая ошибка: Docker не запустился")
+        return
+    
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler('start', start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, execute_code))
